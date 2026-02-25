@@ -6,6 +6,7 @@ use tracing::{error, info};
 use peal::cli::{Cli, Commands};
 use peal::config::PealConfig;
 use peal::error::PealError;
+use peal::plan;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -64,6 +65,23 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 timeout_sec = config.phase_timeout_sec,
                 "config loaded"
             );
+
+            let parsed = plan::parse_plan_file(&config.plan_path)?;
+
+            info!(
+                task_count = parsed.tasks.len(),
+                segment_count = parsed.segments.len(),
+                "plan parsed"
+            );
+
+            for task in &parsed.tasks {
+                info!(
+                    task_index = task.index,
+                    parallel = task.parallel,
+                    content_len = task.content.len(),
+                    "task"
+                );
+            }
 
             Ok(())
         }
