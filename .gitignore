@@ -27,3 +27,8 @@ Thumbs.db
 # Local config overrides (optional)
 .peal.toml.local
 peal.local.toml
+
+
+# Added by cargo
+
+/target
