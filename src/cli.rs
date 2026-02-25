@@ -165,8 +165,10 @@ mod tests {
 
     #[test]
     fn task_flag_parses() {
-        let cli = Cli::try_parse_from(["peal", "run", "--plan", "p.md", "--repo", "/r", "--task", "5"])
-            .expect("should parse --task");
+        let cli = Cli::try_parse_from([
+            "peal", "run", "--plan", "p.md", "--repo", "/r", "--task", "5",
+        ])
+        .expect("should parse --task");
 
         match cli.command {
             Commands::Run(args) => {
@@ -178,8 +180,17 @@ mod tests {
 
     #[test]
     fn from_task_flag_parses() {
-        let cli = Cli::try_parse_from(["peal", "run", "--plan", "p.md", "--repo", "/r", "--from-task", "3"])
-            .expect("should parse --from-task");
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            "p.md",
+            "--repo",
+            "/r",
+            "--from-task",
+            "3",
+        ])
+        .expect("should parse --from-task");
 
         match cli.command {
             Commands::Run(args) => {
@@ -192,8 +203,16 @@ mod tests {
     #[test]
     fn task_and_from_task_conflict() {
         let result = Cli::try_parse_from([
-            "peal", "run", "--plan", "p.md", "--repo", "/r",
-            "--task", "1", "--from-task", "2",
+            "peal",
+            "run",
+            "--plan",
+            "p.md",
+            "--repo",
+            "/r",
+            "--task",
+            "1",
+            "--from-task",
+            "2",
         ]);
         let err = result.expect_err("--task and --from-task should conflict");
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
@@ -203,7 +222,10 @@ mod tests {
     fn no_subcommand_shows_error() {
         let result = Cli::try_parse_from(["peal"]);
         let err = result.expect_err("should fail without subcommand");
-        assert_eq!(err.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     #[test]

@@ -119,20 +119,18 @@ pub fn save_state(state: &PealState, state_dir: &Path) -> Result<(), PealError> 
         detail: format!("failed to create directory: {e}"),
     })?;
 
-    let json =
-        serde_json::to_string_pretty(state).map_err(|e| PealError::StateWriteFailed {
-            path: path.clone(),
-            detail: format!("serialization failed: {e}"),
-        })?;
+    let json = serde_json::to_string_pretty(state).map_err(|e| PealError::StateWriteFailed {
+        path: path.clone(),
+        detail: format!("serialization failed: {e}"),
+    })?;
 
     let tmp_path = state_dir.join("state.json.tmp");
 
     let write_result = (|| -> Result<(), PealError> {
-        let mut f =
-            fs::File::create(&tmp_path).map_err(|e| PealError::StateWriteFailed {
-                path: tmp_path.clone(),
-                detail: e.to_string(),
-            })?;
+        let mut f = fs::File::create(&tmp_path).map_err(|e| PealError::StateWriteFailed {
+            path: tmp_path.clone(),
+            detail: e.to_string(),
+        })?;
         f.write_all(json.as_bytes())
             .map_err(|e| PealError::StateWriteFailed {
                 path: tmp_path.clone(),
@@ -153,6 +151,8 @@ pub fn save_state(state: &PealState, state_dir: &Path) -> Result<(), PealError> 
             path: path.clone(),
             detail: e.to_string(),
         })?;
+        // Best-effort cleanup of temp file after failed rename (e.g. cross-device).
+        // Error is ignored; state was already written to path and we are succeeding.
         let _ = fs::remove_file(&tmp_path);
     }
 
@@ -286,7 +286,9 @@ mod tests {
         state.mark_task_completed(3);
 
         save_state(&state, dir.path()).unwrap();
-        let loaded = load_state(dir.path()).unwrap().expect("should load saved state");
+        let loaded = load_state(dir.path())
+            .unwrap()
+            .expect("should load saved state");
 
         assert_eq!(loaded, state);
     }

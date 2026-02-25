@@ -28,10 +28,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let config_path = args.config.clone();
             let config = PealConfig::load(config_path.as_deref(), &args)?;
 
-            peal::logging::init(
-                config.log_level.as_deref(),
-                config.log_file.as_deref(),
-            )?;
+            peal::logging::init(config.log_level.as_deref(), config.log_file.as_deref())?;
 
             config.validate()?;
 
@@ -82,15 +79,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         "warning: state file does not match current plan/repo paths; starting fresh"
                     );
                     info!("discarding stale state (plan_path or repo_path mismatch)");
-                    state::PealState::new(
-                        config.plan_path.clone(),
-                        config.repo_path.clone(),
-                    )
+                    state::PealState::new(config.plan_path.clone(), config.repo_path.clone())
                 }
-                None => state::PealState::new(
-                    config.plan_path.clone(),
-                    config.repo_path.clone(),
-                ),
+                None => state::PealState::new(config.plan_path.clone(), config.repo_path.clone()),
             };
 
             if !peal_state.completed_task_indices.is_empty() {
@@ -220,13 +211,8 @@ mod tests {
         )
         .unwrap();
 
-        let cli = Cli::try_parse_from([
-            "peal",
-            "run",
-            "--config",
-            cfg_path.to_str().unwrap(),
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["peal", "run", "--config", cfg_path.to_str().unwrap()]).unwrap();
 
         run(cli).expect("should succeed when plan and repo come from config file");
     }
@@ -250,6 +236,8 @@ mod tests {
             dir.path().to_str().unwrap(),
             "--agent-cmd",
             "echo",
+            "--state-dir",
+            dir.path().join(".peal").to_str().unwrap(),
             "--task",
             "2",
         ])
@@ -286,6 +274,8 @@ mod tests {
             dir.path().to_str().unwrap(),
             "--agent-cmd",
             "echo",
+            "--state-dir",
+            dir.path().join(".peal").to_str().unwrap(),
             "--from-task",
             "2",
         ])

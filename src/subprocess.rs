@@ -55,6 +55,7 @@ pub fn run_command<S: AsRef<OsStr>>(
 
     // Take the pipe handles so we can read them on dedicated threads,
     // avoiding deadlock when both pipes fill their OS buffers.
+    // We set Stdio::piped() above, so take() always returns Some.
     let child_stdout = child.stdout.take().expect("stdout was piped");
     let child_stderr = child.stderr.take().expect("stderr was piped");
 
@@ -63,8 +64,12 @@ pub fn run_command<S: AsRef<OsStr>>(
 
     let (timed_out, exit_code) = wait_with_timeout(&mut child, timeout)?;
 
-    let stdout = stdout_handle.join().expect("stdout reader panicked")?;
-    let stderr = stderr_handle.join().expect("stderr reader panicked")?;
+    let stdout = stdout_handle
+        .join()
+        .map_err(|e| std::io::Error::other(format!("stdout reader thread panicked: {e:?}")))??;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|e| std::io::Error::other(format!("stderr reader thread panicked: {e:?}")))??;
 
     Ok(CommandResult {
         stdout,
@@ -128,8 +133,7 @@ mod tests {
 
     #[test]
     fn captures_stdout_from_echo() {
-        let result =
-            run_command("echo", &["hello", "world"], &tmp_dir(), None).unwrap();
+        let result = run_command("echo", &["hello", "world"], &tmp_dir(), None).unwrap();
 
         assert_eq!(result.stdout.trim(), "hello world");
         assert!(result.stderr.is_empty());
@@ -140,8 +144,7 @@ mod tests {
 
     #[test]
     fn captures_nonzero_exit_code() {
-        let result =
-            run_command("false", &[] as &[&str], &tmp_dir(), None).unwrap();
+        let result = run_command("false", &[] as &[&str], &tmp_dir(), None).unwrap();
 
         assert_ne!(result.exit_code, Some(0));
         assert!(!result.success());
@@ -151,8 +154,7 @@ mod tests {
     #[test]
     fn respects_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let result =
-            run_command("pwd", &[] as &[&str], dir.path(), None).unwrap();
+        let result = run_command("pwd", &[] as &[&str], dir.path(), None).unwrap();
 
         // Resolve symlinks for macOS where /tmp -> /private/tmp.
         let expected = dir.path().canonicalize().unwrap();
@@ -177,13 +179,8 @@ mod tests {
 
     #[test]
     fn no_timeout_allows_fast_completion() {
-        let result = run_command(
-            "sleep",
-            &["0"],
-            &tmp_dir(),
-            Some(Duration::from_secs(5)),
-        )
-        .unwrap();
+        let result =
+            run_command("sleep", &["0"], &tmp_dir(), Some(Duration::from_secs(5))).unwrap();
 
         assert!(!result.timed_out);
         assert!(result.success());
@@ -193,21 +190,14 @@ mod tests {
     fn captures_stderr() {
         // sh -c is used only in this test to produce stderr output;
         // the production code path uses direct exec (no shell).
-        let result =
-            run_command("sh", &["-c", "echo err >&2"], &tmp_dir(), None)
-                .unwrap();
+        let result = run_command("sh", &["-c", "echo err >&2"], &tmp_dir(), None).unwrap();
 
         assert_eq!(result.stderr.trim(), "err");
     }
 
     #[test]
     fn spawn_failure_returns_io_error() {
-        let result = run_command(
-            "nonexistent-binary-xyz",
-            &[] as &[&str],
-            &tmp_dir(),
-            None,
-        );
+        let result = run_command("nonexistent-binary-xyz", &[] as &[&str], &tmp_dir(), None);
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);

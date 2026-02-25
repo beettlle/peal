@@ -87,9 +87,7 @@ mod tests {
     fn phase1_wraps_task_in_delimiters() {
         let prompt = phase1("Add a login form with OAuth support.");
         assert!(
-            prompt.starts_with(
-                "Create a plan for implementing this task:\n\n---TASK---\n"
-            ),
+            prompt.starts_with("Create a plan for implementing this task:\n\n---TASK---\n"),
             "should start with instruction + delimiter, got: {prompt}"
         );
         assert!(
@@ -208,11 +206,29 @@ mod tests {
         let p2 = phase2("plan");
         let p3 = phase3("stet");
 
-        assert!(!p1.contains("---PLAN---"), "phase 1 must not use PLAN delimiter");
-        assert!(!p1.contains("---STET---"), "phase 1 must not use STET delimiter");
-        assert!(!p2.contains("---TASK---"), "phase 2 must not use TASK delimiter");
-        assert!(!p2.contains("---STET---"), "phase 2 must not use STET delimiter");
-        assert!(!p3.contains("---TASK---"), "phase 3 must not use TASK delimiter");
-        assert!(!p3.contains("---PLAN---"), "phase 3 must not use PLAN delimiter");
+        assert!(
+            !p1.contains("---PLAN---"),
+            "phase 1 must not use PLAN delimiter"
+        );
+        assert!(
+            !p1.contains("---STET---"),
+            "phase 1 must not use STET delimiter"
+        );
+        assert!(
+            !p2.contains("---TASK---"),
+            "phase 2 must not use TASK delimiter"
+        );
+        assert!(
+            !p2.contains("---STET---"),
+            "phase 2 must not use STET delimiter"
+        );
+        assert!(
+            !p3.contains("---TASK---"),
+            "phase 3 must not use TASK delimiter"
+        );
+        assert!(
+            !p3.contains("---PLAN---"),
+            "phase 3 must not use PLAN delimiter"
+        );
     }
 }

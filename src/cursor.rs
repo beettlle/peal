@@ -150,7 +150,10 @@ mod tests {
 
         let path_var = OsString::from(dir.path().as_os_str());
         let result = resolve_agent_cmd_with("my-agent", Some(path_var));
-        assert!(result.is_ok(), "should find binary in custom PATH: {result:?}");
+        assert!(
+            result.is_ok(),
+            "should find binary in custom PATH: {result:?}"
+        );
         assert_eq!(result.unwrap(), bin);
     }
 

@@ -140,9 +140,7 @@ impl PealConfig {
             plan_path,
             repo_path,
             stet_commands: merged.stet_commands.unwrap_or_default(),
-            sandbox: merged
-                .sandbox
-                .unwrap_or_else(|| DEFAULT_SANDBOX.to_owned()),
+            sandbox: merged.sandbox.unwrap_or_else(|| DEFAULT_SANDBOX.to_owned()),
             model: merged.model,
             max_address_rounds: merged
                 .max_address_rounds
@@ -188,7 +186,9 @@ fn real_env_var(suffix: &str) -> Option<String> {
     env::var(&key).ok().filter(|v| !v.is_empty())
 }
 
-fn load_env_layer(env_fn: fn(&str) -> Option<String>) -> Result<ConfigLayer, crate::error::PealError> {
+fn load_env_layer(
+    env_fn: fn(&str) -> Option<String>,
+) -> Result<ConfigLayer, crate::error::PealError> {
     Ok(ConfigLayer {
         agent_cmd: env_fn("AGENT_CMD"),
         plan_path: env_fn("PLAN_PATH").map(PathBuf::from),
@@ -212,12 +212,14 @@ fn parse_env_u32(
     suffix: &str,
 ) -> Result<Option<u32>, crate::error::PealError> {
     match env_fn(suffix) {
-        Some(s) => s.parse::<u32>().map(Some).map_err(|e| {
-            crate::error::PealError::ConfigEnvParseError {
-                var: format!("{ENV_PREFIX}{suffix}"),
-                detail: e.to_string(),
-            }
-        }),
+        Some(s) => {
+            s.parse::<u32>()
+                .map(Some)
+                .map_err(|e| crate::error::PealError::ConfigEnvParseError {
+                    var: format!("{ENV_PREFIX}{suffix}"),
+                    detail: e.to_string(),
+                })
+        }
         None => Ok(None),
     }
 }
@@ -227,12 +229,14 @@ fn parse_env_u64(
     suffix: &str,
 ) -> Result<Option<u64>, crate::error::PealError> {
     match env_fn(suffix) {
-        Some(s) => s.parse::<u64>().map(Some).map_err(|e| {
-            crate::error::PealError::ConfigEnvParseError {
-                var: format!("{ENV_PREFIX}{suffix}"),
-                detail: e.to_string(),
-            }
-        }),
+        Some(s) => {
+            s.parse::<u64>()
+                .map(Some)
+                .map_err(|e| crate::error::PealError::ConfigEnvParseError {
+                    var: format!("{ENV_PREFIX}{suffix}"),
+                    detail: e.to_string(),
+                })
+        }
         None => Ok(None),
     }
 }
@@ -242,12 +246,14 @@ fn parse_env_bool(
     suffix: &str,
 ) -> Result<Option<bool>, crate::error::PealError> {
     match env_fn(suffix) {
-        Some(s) => s.parse::<bool>().map(Some).map_err(|e| {
-            crate::error::PealError::ConfigEnvParseError {
-                var: format!("{ENV_PREFIX}{suffix}"),
-                detail: e.to_string(),
-            }
-        }),
+        Some(s) => {
+            s.parse::<bool>()
+                .map(Some)
+                .map_err(|e| crate::error::PealError::ConfigEnvParseError {
+                    var: format!("{ENV_PREFIX}{suffix}"),
+                    detail: e.to_string(),
+                })
+        }
         None => Ok(None),
     }
 }
@@ -292,10 +298,7 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .or(env.phase_timeout_sec)
             .or(file.phase_timeout_sec),
         parallel: cli.parallel.or(env.parallel).or(file.parallel),
-        max_parallel: cli
-            .max_parallel
-            .or(env.max_parallel)
-            .or(file.max_parallel),
+        max_parallel: cli.max_parallel.or(env.max_parallel).or(file.max_parallel),
         log_level: cli.log_level.or(env.log_level).or(file.log_level),
         log_file: cli.log_file.or(env.log_file).or(file.log_file),
     }
@@ -322,6 +325,8 @@ mod tests {
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            task: None,
+            from_task: None,
             log_level: None,
             log_file: None,
         }
@@ -429,6 +434,8 @@ model = "from-file"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            task: None,
+            from_task: None,
             log_level: None,
             log_file: None,
         };
@@ -489,6 +496,8 @@ agent_cmd = "from-file"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            task: None,
+            from_task: None,
             log_level: None,
             log_file: None,
         };
@@ -536,9 +545,8 @@ bogus_key = true
     #[test]
     fn missing_config_file_returns_error() {
         let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
-        let err =
-            PealConfig::load_with_env(Some(Path::new("/no/such/file.toml")), &args, no_env)
-                .unwrap_err();
+        let err = PealConfig::load_with_env(Some(Path::new("/no/such/file.toml")), &args, no_env)
+            .unwrap_err();
         assert!(
             format!("{err}").contains("failed to read config file"),
             "unexpected: {err}"
@@ -575,6 +583,8 @@ bogus_key = true
             parallel: true,
             max_parallel: Some(2),
             max_address_rounds: None,
+            task: None,
+            from_task: None,
             log_level: None,
             log_file: None,
         };
@@ -729,6 +739,8 @@ sandbox = "file-sandbox"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            task: None,
+            from_task: None,
             log_level: None,
             log_file: None,
         };

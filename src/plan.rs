@@ -1,8 +1,18 @@
 use std::path::Path;
+use std::sync::OnceLock;
 
 use regex::Regex;
 
 use crate::error::PealError;
+
+/// Compiled once; the pattern is a valid literal so init cannot fail at runtime.
+static HEADING_RE: OnceLock<Regex> = OnceLock::new();
+
+fn heading_re() -> &'static Regex {
+    HEADING_RE.get_or_init(|| {
+        Regex::new(r"^## Task\s+(\d+)\s*(\(parallel\))?\s*$").expect("valid literal regex")
+    })
+}
 
 /// A single task parsed from the plan file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,14 +42,27 @@ pub struct ParsedPlan {
 
 /// Read a plan file at `path` and parse it into tasks and segments.
 ///
-/// Rejects non-UTF-8 content and I/O failures with `PealError::InvalidPlanFile`.
+/// Rejects non-UTF-8 content and I/O failures with `PealError::InvalidPlanFile`
+/// or `PealError::PlanFileNotFound` when the file does not exist.
 pub fn parse_plan_file(path: &Path) -> anyhow::Result<ParsedPlan> {
-    let bytes = std::fs::read(path).map_err(|_| PealError::InvalidPlanFile {
-        path: path.to_path_buf(),
+    let bytes = std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(PealError::PlanFileNotFound {
+                path: path.to_path_buf(),
+            })
+        } else {
+            anyhow::anyhow!(PealError::InvalidPlanFile {
+                path: path.to_path_buf(),
+            })
+            .context(e)
+        }
     })?;
 
-    let content = String::from_utf8(bytes).map_err(|_| PealError::InvalidPlanFile {
-        path: path.to_path_buf(),
+    let content = String::from_utf8(bytes).map_err(|e| {
+        anyhow::anyhow!(PealError::InvalidPlanFile {
+            path: path.to_path_buf(),
+        })
+        .context(e)
     })?;
 
     parse_plan(&content)
@@ -52,8 +75,7 @@ pub fn parse_plan_file(path: &Path) -> anyhow::Result<ParsedPlan> {
 /// Tasks are returned sorted by ascending index; gaps are allowed.
 pub fn parse_plan(content: &str) -> anyhow::Result<ParsedPlan> {
     let content = content.replace("\r\n", "\n");
-    let heading_re = Regex::new(r"^## Task\s+(\d+)\s*(\(parallel\))?\s*$")
-        .expect("heading regex is a compile-time constant");
+    let heading_re = heading_re();
 
     let mut tasks: Vec<Task> = Vec::new();
     let mut current_index: Option<u32> = None;
@@ -69,6 +91,7 @@ pub fn parse_plan(content: &str) -> anyhow::Result<ParsedPlan> {
                     parallel: current_parallel,
                 });
             }
+            // Capture 1 is \d+ so parse cannot fail.
             current_index = Some(
                 caps[1]
                     .parse::<u32>()
@@ -102,7 +125,11 @@ impl ParsedPlan {
     /// Segments are recomputed from the filtered task list.
     pub fn filter_single_task(self, index: u32) -> Result<ParsedPlan, PealError> {
         let available: Vec<u32> = self.tasks.iter().map(|t| t.index).collect();
-        let tasks: Vec<Task> = self.tasks.into_iter().filter(|t| t.index == index).collect();
+        let tasks: Vec<Task> = self
+            .tasks
+            .into_iter()
+            .filter(|t| t.index == index)
+            .collect();
         if tasks.is_empty() {
             return Err(PealError::TaskNotFound { index, available });
         }
@@ -468,7 +495,7 @@ G
         let err = parse_plan_file(&path).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("Invalid or missing plan file"),
+            msg.contains("Invalid or missing plan file") || msg.contains("invalid utf-8"),
             "expected UTF-8 rejection, got: {msg}"
         );
     }
@@ -478,7 +505,7 @@ G
         let err = parse_plan_file(Path::new("/no/such/file.md")).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("Invalid or missing plan file"),
+            msg.contains("does not exist"),
             "expected file-not-found error, got: {msg}"
         );
     }
@@ -486,10 +513,7 @@ G
     // -- filter_single_task / filter_from_task tests --
 
     fn make_plan_123() -> ParsedPlan {
-        parse_plan(
-            "## Task 1\nA\n\n## Task 2\nB\n\n## Task 3\nC\n",
-        )
-        .unwrap()
+        parse_plan("## Task 1\nA\n\n## Task 2\nB\n\n## Task 3\nC\n").unwrap()
     }
 
     #[test]
@@ -559,11 +583,14 @@ C
 D
 ";
         let plan = parse_plan(input).unwrap();
-        assert_eq!(plan.segments, vec![
-            Segment::Sequential(1),
-            Segment::Parallel(vec![2, 3]),
-            Segment::Sequential(4),
-        ]);
+        assert_eq!(
+            plan.segments,
+            vec![
+                Segment::Sequential(1),
+                Segment::Parallel(vec![2, 3]),
+                Segment::Sequential(4),
+            ]
+        );
 
         // Filtering from task 3 breaks the parallel block: task 3 alone becomes sequential.
         let filtered = plan.filter_from_task(3).unwrap();
@@ -582,17 +609,29 @@ D
         let plan4 = parse_plan_file(&root.join("docs/plan-phase4.md")).unwrap();
         let plan5 = parse_plan_file(&root.join("docs/plan-phase5.md")).unwrap();
         let plan6 = parse_plan_file(&root.join("docs/plan-phase6.md")).unwrap();
-        assert_eq!(plan4.tasks.len(), 6, "plan-phase4.md should have 6 tasks");
+        assert_eq!(plan4.tasks.len(), 7, "plan-phase4.md should have 7 tasks");
         assert_eq!(plan5.tasks.len(), 5, "plan-phase5.md should have 5 tasks");
         assert_eq!(plan6.tasks.len(), 3, "plan-phase6.md should have 3 tasks");
         for t in &plan4.tasks {
-            assert!(!t.content.trim().is_empty(), "phase4 task {} has non-empty body", t.index);
+            assert!(
+                !t.content.trim().is_empty(),
+                "phase4 task {} has non-empty body",
+                t.index
+            );
         }
         for t in &plan5.tasks {
-            assert!(!t.content.trim().is_empty(), "phase5 task {} has non-empty body", t.index);
+            assert!(
+                !t.content.trim().is_empty(),
+                "phase5 task {} has non-empty body",
+                t.index
+            );
         }
         for t in &plan6.tasks {
-            assert!(!t.content.trim().is_empty(), "phase6 task {} has non-empty body", t.index);
+            assert!(
+                !t.content.trim().is_empty(),
+                "phase6 task {} has non-empty body",
+                t.index
+            );
         }
     }
 }

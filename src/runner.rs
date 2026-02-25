@@ -52,24 +52,20 @@ pub fn run_phase1_all(
         if peal_state.is_task_completed(task.index) {
             info!(
                 task_index = task.index,
-                position,
-                task_count,
-                "skipping already-completed task {position}/{task_count}"
+                position, task_count, "skipping already-completed task {position}/{task_count}"
             );
             continue;
         }
 
         info!(
             task_index = task.index,
-            position,
-            task_count,
-            "phase 1: task {position}/{task_count}"
+            position, task_count, "phase 1: task {position}/{task_count}"
         );
 
         let start = Instant::now();
 
-        let output: PhaseOutput =
-            phase::run_phase1(agent_path, config, task.index, &task.content).map_err(|e| {
+        let output: PhaseOutput = phase::run_phase1(agent_path, config, task.index, &task.content)
+            .map_err(|e| {
                 error!(
                     task_index = task.index,
                     position,
@@ -138,9 +134,7 @@ pub fn run_all(
         if peal_state.is_task_completed(task.index) {
             info!(
                 task_index = task.index,
-                position,
-                task_count,
-                "skipping already-completed task {position}/{task_count}"
+                position, task_count, "skipping already-completed task {position}/{task_count}"
             );
             continue;
         }
@@ -148,9 +142,7 @@ pub fn run_all(
         // -- Phase 1 --
         info!(
             task_index = task.index,
-            position,
-            task_count,
-            "phase 1: task {position}/{task_count}"
+            position, task_count, "phase 1: task {position}/{task_count}"
         );
 
         let p1_start = Instant::now();
@@ -184,9 +176,7 @@ pub fn run_all(
         // -- Phase 2 --
         info!(
             task_index = task.index,
-            position,
-            task_count,
-            "phase 2: task {position}/{task_count}"
+            position, task_count, "phase 2: task {position}/{task_count}"
         );
 
         let p2_start = Instant::now();
@@ -265,10 +255,7 @@ mod tests {
     }
 
     fn make_plan(tasks: Vec<Task>) -> ParsedPlan {
-        let segments = tasks
-            .iter()
-            .map(|t| Segment::Sequential(t.index))
-            .collect();
+        let segments = tasks.iter().map(|t| Segment::Sequential(t.index)).collect();
         ParsedPlan { tasks, segments }
     }
 
@@ -311,7 +298,8 @@ mod tests {
 
         for r in &results {
             assert!(
-                r.plan_text.contains("Create a plan for implementing this task:"),
+                r.plan_text
+                    .contains("Create a plan for implementing this task:"),
                 "plan text should contain the prompt (echoed back): {:?}",
                 r.plan_text
             );
@@ -351,8 +339,7 @@ mod tests {
             log_file: None,
         };
 
-        let false_path =
-            crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
         let state_dir = dir.path().join(".peal");
         let mut state = fresh_state();
 
@@ -506,8 +493,7 @@ mod tests {
             log_file: None,
         };
 
-        let false_path =
-            crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
         let state_dir = dir.path().join(".peal");
         let mut state = fresh_state();
 
@@ -551,7 +537,11 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_index, 7);
         assert!(results[0].plan_text.contains("The only task."));
-        assert!(results[0].phase2_stdout.contains("Execute the following plan"));
+        assert!(
+            results[0]
+                .phase2_stdout
+                .contains("Execute the following plan")
+        );
     }
 
     #[test]
@@ -603,9 +593,7 @@ mod tests {
         let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert!(
-            results[0]
-                .phase2_stdout
-                .contains("---PLAN---"),
+            results[0].phase2_stdout.contains("---PLAN---"),
             "phase 2 output should contain plan delimiters: {:?}",
             results[0].phase2_stdout
         );
@@ -622,9 +610,21 @@ mod tests {
         let mut state = fresh_state();
 
         let plan = make_plan(vec![
-            Task { index: 1, content: "A.".to_owned(), parallel: false },
-            Task { index: 2, content: "B.".to_owned(), parallel: false },
-            Task { index: 3, content: "C.".to_owned(), parallel: false },
+            Task {
+                index: 1,
+                content: "A.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "B.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 3,
+                content: "C.".to_owned(),
+                parallel: false,
+            },
         ]);
 
         run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
@@ -641,8 +641,7 @@ mod tests {
         let state_dir = dir.path().join(".peal");
 
         let echo = resolve_echo();
-        let false_path =
-            crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
 
         // Run first task successfully with echo, then simulate failure.
         // We can't mix agents mid-run, so we use `false` for all tasks
@@ -665,8 +664,16 @@ mod tests {
 
         let mut state = fresh_state();
         let plan = make_plan(vec![
-            Task { index: 1, content: "Will fail.".to_owned(), parallel: false },
-            Task { index: 2, content: "Never reached.".to_owned(), parallel: false },
+            Task {
+                index: 1,
+                content: "Will fail.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "Never reached.".to_owned(),
+                parallel: false,
+            },
         ]);
 
         let _ = run_all(&false_path, &config, &plan, &mut state, &state_dir);
@@ -682,8 +689,16 @@ mod tests {
         // Now run successfully with echo to verify partial completion.
         let good_config = test_config(dir.path());
         let plan2 = make_plan(vec![
-            Task { index: 10, content: "A.".to_owned(), parallel: false },
-            Task { index: 20, content: "B.".to_owned(), parallel: false },
+            Task {
+                index: 10,
+                content: "A.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 20,
+                content: "B.".to_owned(),
+                parallel: false,
+            },
         ]);
 
         let mut state2 = fresh_state();
@@ -705,9 +720,11 @@ mod tests {
 
         assert!(!state_dir.exists());
 
-        let plan = make_plan(vec![
-            Task { index: 1, content: "X.".to_owned(), parallel: false },
-        ]);
+        let plan = make_plan(vec![Task {
+            index: 1,
+            content: "X.".to_owned(),
+            parallel: false,
+        }]);
 
         run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
@@ -727,9 +744,21 @@ mod tests {
         state.mark_task_completed(1);
 
         let plan = make_plan(vec![
-            Task { index: 1, content: "Already done.".to_owned(), parallel: false },
-            Task { index: 2, content: "Still pending.".to_owned(), parallel: false },
-            Task { index: 3, content: "Also pending.".to_owned(), parallel: false },
+            Task {
+                index: 1,
+                content: "Already done.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "Still pending.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 3,
+                content: "Also pending.".to_owned(),
+                parallel: false,
+            },
         ]);
 
         let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
@@ -750,9 +779,21 @@ mod tests {
         state.mark_task_completed(2);
 
         let plan = make_plan(vec![
-            Task { index: 1, content: "Done.".to_owned(), parallel: false },
-            Task { index: 2, content: "Done.".to_owned(), parallel: false },
-            Task { index: 3, content: "Pending.".to_owned(), parallel: false },
+            Task {
+                index: 1,
+                content: "Done.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "Done.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 3,
+                content: "Pending.".to_owned(),
+                parallel: false,
+            },
         ]);
 
         let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
@@ -773,13 +814,24 @@ mod tests {
         state.mark_task_completed(2);
 
         let plan = make_plan(vec![
-            Task { index: 1, content: "Done.".to_owned(), parallel: false },
-            Task { index: 2, content: "Done.".to_owned(), parallel: false },
+            Task {
+                index: 1,
+                content: "Done.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "Done.".to_owned(),
+                parallel: false,
+            },
         ]);
 
         let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
-        assert!(results.is_empty(), "no tasks should run when all are completed");
+        assert!(
+            results.is_empty(),
+            "no tasks should run when all are completed"
+        );
     }
 
     #[test]
@@ -796,10 +848,26 @@ mod tests {
         state::save_state(&state, &state_dir).unwrap();
 
         let plan = make_plan(vec![
-            Task { index: 1, content: "A.".to_owned(), parallel: false },
-            Task { index: 2, content: "B.".to_owned(), parallel: false },
-            Task { index: 3, content: "C.".to_owned(), parallel: false },
-            Task { index: 4, content: "D.".to_owned(), parallel: false },
+            Task {
+                index: 1,
+                content: "A.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "B.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 3,
+                content: "C.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 4,
+                content: "D.".to_owned(),
+                parallel: false,
+            },
         ]);
 
         let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();

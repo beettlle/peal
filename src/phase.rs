@@ -350,10 +350,7 @@ mod tests {
         };
         let err = check_result(1, 1, 300, &result).unwrap_err();
         match err {
-            PealError::PhaseTimedOut {
-                phase,
-                timeout_sec,
-            } => {
+            PealError::PhaseTimedOut { phase, timeout_sec } => {
                 assert_eq!(phase, 1);
                 assert_eq!(timeout_sec, 300);
             }
@@ -492,7 +489,9 @@ mod tests {
         // echo receives the full argv and prints it to stdout; we verify
         // the prompt appears as the last positional arg.
         assert!(
-            output.stdout.contains("Create a plan for implementing this task:"),
+            output
+                .stdout
+                .contains("Create a plan for implementing this task:"),
             "stdout should contain the phase 1 instruction: {:?}",
             output.stdout
         );
@@ -563,10 +562,7 @@ mod tests {
         let err = run_phase1(&sleep_path, &config, 1, "60").unwrap_err();
 
         match err {
-            PealError::PhaseTimedOut {
-                phase,
-                timeout_sec,
-            } => {
+            PealError::PhaseTimedOut { phase, timeout_sec } => {
                 assert_eq!(phase, 1);
                 assert_eq!(timeout_sec, 1);
             }
@@ -806,16 +802,12 @@ mod tests {
             crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
         };
 
-        let output = run_phase3(
-            &actual_echo,
-            &config,
-            1,
-            "warning: unused variable `x`",
-        )
-        .unwrap();
+        let output = run_phase3(&actual_echo, &config, 1, "warning: unused variable `x`").unwrap();
 
         assert!(
-            output.stdout.contains("Address the following stet review findings"),
+            output
+                .stdout
+                .contains("Address the following stet review findings"),
             "stdout should contain the phase 3 instruction: {:?}",
             output.stdout
         );
