@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+# Cargo.lock: commit for applications (reproducible builds)
+
+# PEAL runtime state (default .peal/state.json)
+.peal/
+
+# Logs and temp
+*.log
+/tmp/
+/temp/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE / editors
+.idea/
+.vscode/
+.cursor/
+*.iml
+
+# Local config overrides (optional)
+.peal.toml.local
+peal.local.toml
