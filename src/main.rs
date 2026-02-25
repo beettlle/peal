@@ -5,7 +5,6 @@ use tracing::{error, info};
 
 use peal::cli::{Cli, Commands};
 use peal::config::PealConfig;
-use peal::error::PealError;
 use peal::plan;
 
 fn main() -> ExitCode {
@@ -31,30 +30,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 config.log_file.as_deref(),
             )?;
 
-            if !config.plan_path.exists() {
-                return Err(PealError::PlanFileNotFound {
-                    path: config.plan_path.clone(),
-                }
-                .into());
-            }
-            if !config.plan_path.is_file() {
-                return Err(PealError::InvalidPlanFile {
-                    path: config.plan_path.clone(),
-                }
-                .into());
-            }
-            if !config.repo_path.exists() {
-                return Err(PealError::RepoPathNotFound {
-                    path: config.repo_path.clone(),
-                }
-                .into());
-            }
-            if !config.repo_path.is_dir() {
-                return Err(PealError::RepoNotDirectory {
-                    path: config.repo_path.clone(),
-                }
-                .into());
-            }
+            config.validate()?;
 
             info!(
                 plan = %config.plan_path.display(),

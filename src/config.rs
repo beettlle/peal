@@ -83,6 +83,33 @@ impl PealConfig {
         Self::load_with_env(config_path, cli_args, real_env_var)
     }
 
+    /// Validate that resolved paths satisfy filesystem requirements:
+    /// plan_path must exist and be a regular file; repo_path must exist and
+    /// be a directory.
+    pub fn validate(&self) -> Result<(), crate::error::PealError> {
+        if !self.plan_path.exists() {
+            return Err(crate::error::PealError::PlanFileNotFound {
+                path: self.plan_path.clone(),
+            });
+        }
+        if !self.plan_path.is_file() {
+            return Err(crate::error::PealError::InvalidPlanFile {
+                path: self.plan_path.clone(),
+            });
+        }
+        if !self.repo_path.exists() {
+            return Err(crate::error::PealError::RepoPathNotFound {
+                path: self.repo_path.clone(),
+            });
+        }
+        if !self.repo_path.is_dir() {
+            return Err(crate::error::PealError::RepoNotDirectory {
+                path: self.repo_path.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// Internal constructor that accepts an env-var lookup function,
     /// enabling deterministic testing without process-global mutation.
     fn load_with_env(
@@ -510,6 +537,91 @@ bogus_key = true
 
         assert!(cfg.parallel);
         assert_eq!(cfg.max_parallel, 2);
+    }
+
+    // -- validate() tests --
+
+    #[test]
+    fn validate_succeeds_with_valid_file_and_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
+
+        let args = minimal_cli_args(Some(plan_path), Some(dir.path().to_path_buf()));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        cfg.validate().expect("should succeed with valid paths");
+    }
+
+    #[test]
+    fn validate_fails_when_plan_path_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = minimal_cli_args(
+            Some(dir.path().join("nonexistent.md")),
+            Some(dir.path().to_path_buf()),
+        );
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not exist"),
+            "expected 'does not exist', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_fails_when_plan_path_is_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+
+        let args = minimal_cli_args(Some(sub), Some(dir.path().to_path_buf()));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Invalid or missing plan file"),
+            "expected 'Invalid or missing plan file', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_fails_when_repo_path_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
+
+        let args = minimal_cli_args(Some(plan_path), Some(PathBuf::from("/no/such/repo")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not exist"),
+            "expected 'does not exist', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_fails_when_repo_path_is_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
+
+        let fake_repo = dir.path().join("not-a-dir.txt");
+        fs::write(&fake_repo, "I am a file").unwrap();
+
+        let args = minimal_cli_args(Some(plan_path), Some(fake_repo));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a directory"),
+            "expected 'not a directory', got: {msg}"
+        );
     }
 
     #[test]
