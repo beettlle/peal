@@ -7,6 +7,7 @@ use peal::cli::{Cli, Commands};
 use peal::config::PealConfig;
 use peal::cursor;
 use peal::plan;
+use peal::runner;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -54,12 +55,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 "plan parsed"
             );
 
-            for task in &parsed.tasks {
+            let results = runner::run_phase1_all(&agent_path, &config, &parsed)?;
+
+            for r in &results {
                 info!(
-                    task_index = task.index,
-                    parallel = task.parallel,
-                    content_len = task.content.len(),
-                    "task"
+                    task_index = r.task_index,
+                    plan_text_len = r.plan_text.len(),
+                    "captured plan text"
                 );
             }
 
@@ -133,6 +135,8 @@ mod tests {
             plan_path.to_str().unwrap(),
             "--repo",
             dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "echo",
         ])
         .unwrap();
 
@@ -149,7 +153,7 @@ mod tests {
         fs::write(
             &cfg_path,
             format!(
-                "plan_path = {:?}\nrepo_path = {:?}\n",
+                "plan_path = {:?}\nrepo_path = {:?}\nagent_cmd = \"echo\"\n",
                 plan_path.to_str().unwrap(),
                 dir.path().to_str().unwrap(),
             ),

@@ -6,4 +6,5 @@ pub mod logging;
 pub mod phase;
 pub mod plan;
 pub mod prompt;
+pub mod runner;
 pub mod subprocess;
