@@ -3,6 +3,9 @@
 //! Each phase constructs a Cursor CLI command and invokes it via
 //! `subprocess::run_command`.  This module owns the argv layout so
 //! that changes to CLI flags happen in one place.
+//!
+//! Prompt strings are built exclusively by the `prompt` module; this
+//! module only passes them as the final positional arg in the argv.
 
 use std::path::Path;
 use std::time::Duration;
@@ -138,6 +141,66 @@ pub fn run_phase2(
 /// Phase 2 omits `--plan` (execution, not planning) and includes
 /// `--sandbox` from config.
 fn phase2_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        "--print".to_owned(),
+        "--workspace".to_owned(),
+        config.repo_path.to_string_lossy().into_owned(),
+        "--sandbox".to_owned(),
+        config.sandbox.clone(),
+    ];
+
+    if let Some(ref model) = config.model {
+        args.push("--model".to_owned());
+        args.push(model.clone());
+    }
+
+    args.push(prompt.to_owned());
+    args
+}
+
+/// Run Phase 3 (address stet findings) for a single task.
+///
+/// Builds the prompt via `prompt::phase3`, constructs the `agent` argv
+/// (same layout as Phase 2: no `--plan`, with `--sandbox`), invokes the
+/// subprocess, and returns the captured output.  On timeout or non-zero
+/// exit, returns an error.
+pub fn run_phase3(
+    agent_path: &Path,
+    config: &PealConfig,
+    task_index: u32,
+    stet_output: &str,
+) -> Result<PhaseOutput, PealError> {
+    let prompt = prompt::phase3(stet_output);
+    let args = phase3_argv(config, &prompt);
+    let timeout = Duration::from_secs(config.phase_timeout_sec);
+
+    let agent_str = agent_path.to_string_lossy();
+
+    info!(
+        phase = 3,
+        task_index,
+        agent = %agent_str,
+        timeout_sec = config.phase_timeout_sec,
+        "invoking phase 3"
+    );
+    debug!(phase = 3, task_index, ?args, "phase 3 argv");
+
+    let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
+        .map_err(|e| PealError::PhaseSpawnFailed {
+            phase: 3,
+            detail: e.to_string(),
+        })?;
+
+    check_result(3, task_index, config.phase_timeout_sec, &result)?;
+
+    Ok(PhaseOutput {
+        stdout: result.stdout,
+        stderr: result.stderr,
+    })
+}
+
+/// Build the argv for a Phase 3 invocation (same layout as Phase 2).
+fn phase3_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
     let mut args = vec![
         "--print".to_owned(),
         "--workspace".to_owned(),
@@ -429,8 +492,18 @@ mod tests {
         // echo receives the full argv and prints it to stdout; we verify
         // the prompt appears as the last positional arg.
         assert!(
-            output.stdout.contains("Create a plan for implementing this task: Build the widget."),
-            "stdout should contain the prompt: {:?}",
+            output.stdout.contains("Create a plan for implementing this task:"),
+            "stdout should contain the phase 1 instruction: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("---TASK---"),
+            "stdout should contain the task delimiter: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Build the widget."),
+            "stdout should contain the task content: {:?}",
             output.stdout
         );
     }
@@ -638,6 +711,182 @@ mod tests {
                 assert!(!detail.is_empty());
             }
             other => panic!("expected PhaseSpawnFailed for phase 2, got: {other:?}"),
+        }
+    }
+
+    // -- Phase 3 argv construction tests --
+
+    #[test]
+    fn phase3_argv_without_model() {
+        let config = test_config(None);
+        let args = phase3_argv(&config, "Address findings.");
+
+        assert_eq!(
+            args,
+            vec![
+                "--print",
+                "--workspace",
+                "/my/repo",
+                "--sandbox",
+                "disabled",
+                "Address findings.",
+            ]
+        );
+    }
+
+    #[test]
+    fn phase3_argv_with_model() {
+        let config = test_config(Some("claude-4-opus"));
+        let args = phase3_argv(&config, "Address findings.");
+
+        assert_eq!(
+            args,
+            vec![
+                "--print",
+                "--workspace",
+                "/my/repo",
+                "--sandbox",
+                "disabled",
+                "--model",
+                "claude-4-opus",
+                "Address findings.",
+            ]
+        );
+    }
+
+    #[test]
+    fn phase3_argv_does_not_contain_plan_flag() {
+        let config = test_config(Some("model"));
+        let args = phase3_argv(&config, "prompt");
+
+        assert!(
+            !args.contains(&"--plan".to_owned()),
+            "phase 3 must not include --plan flag"
+        );
+    }
+
+    #[test]
+    fn phase3_argv_prompt_is_last_arg() {
+        let config = test_config(Some("gpt-5"));
+        let prompt_text = "Address the following stet review findings.";
+        let args = phase3_argv(&config, prompt_text);
+
+        assert_eq!(
+            args.last().unwrap(),
+            prompt_text,
+            "prompt must be the final positional arg"
+        );
+    }
+
+    // -- Phase 3 integration-style tests --
+
+    #[test]
+    fn run_phase3_with_echo_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "echo".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+        };
+
+        let echo_path = PathBuf::from("/bin/echo");
+        let actual_echo = if echo_path.exists() {
+            echo_path
+        } else {
+            crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
+        };
+
+        let output = run_phase3(
+            &actual_echo,
+            &config,
+            1,
+            "warning: unused variable `x`",
+        )
+        .unwrap();
+
+        assert!(
+            output.stdout.contains("Address the following stet review findings"),
+            "stdout should contain the phase 3 instruction: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("---STET---"),
+            "stdout should contain the stet delimiter: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("unused variable"),
+            "stdout should contain the stet output: {:?}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn run_phase3_fails_on_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "false".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+        };
+
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let err = run_phase3(&false_path, &config, 1, "stet output").unwrap_err();
+
+        match err {
+            PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 3),
+            other => panic!("expected PhaseNonZeroExit for phase 3, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_phase3_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "nonexistent".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+        };
+
+        let bad_path = PathBuf::from("/no/such/binary");
+        let err = run_phase3(&bad_path, &config, 1, "stet output").unwrap_err();
+
+        match err {
+            PealError::PhaseSpawnFailed { phase, detail } => {
+                assert_eq!(phase, 3);
+                assert!(!detail.is_empty());
+            }
+            other => panic!("expected PhaseSpawnFailed for phase 3, got: {other:?}"),
         }
     }
 }
