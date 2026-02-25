@@ -3,5 +3,7 @@ pub mod config;
 pub mod cursor;
 pub mod error;
 pub mod logging;
+pub mod phase;
 pub mod plan;
+pub mod prompt;
 pub mod subprocess;

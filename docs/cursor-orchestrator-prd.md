@@ -295,3 +295,12 @@ Rust is required. Subprocess output SHALL be read into standard types (e.g. `Str
 - Cloud Agent integration unless explicitly added later.
 - Web UI or IDE plugin; CLI-only orchestrator.
 - Dependency DAG between tasks (e.g. Task 3 depends on Task 1); only consecutive parallel blocks are supported.
+
+---
+
+## 16. Future Considerations
+
+### Adversarial development
+
+An optional phase may be added in a future revision where the orchestrator runs a **critical / adversarial pass** over the code produced in Phase 2 (execute). The purpose would be to have a model or separate step "attack" or critique the implementation—surfacing bugs, missing edge cases, security concerns, and design weaknesses—distinct from stet's defect-focused diff review. The output would be fed into the same "address findings" style flow (Cursor CLI with the critique in the prompt), with configurable placement (e.g. before stet, after stet, or when stet is not used) and a configurable max rounds. This would be opt-in via config (e.g. `adversarial: true`) and is not part of v1.
+

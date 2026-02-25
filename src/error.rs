@@ -21,4 +21,17 @@ pub enum PealError {
          Install it from {CURSOR_CLI_INSTALL_URL}"
     )]
     AgentCmdNotFound { cmd: String },
+
+    #[error("Phase {phase} failed to start: {detail}")]
+    PhaseSpawnFailed { phase: u32, detail: String },
+
+    #[error("Phase {phase} timed out after {timeout_sec}s")]
+    PhaseTimedOut { phase: u32, timeout_sec: u64 },
+
+    #[error("Phase {phase} exited with code {exit_code:?}")]
+    PhaseNonZeroExit {
+        phase: u32,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
 }
