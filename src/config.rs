@@ -12,7 +12,7 @@ const DEFAULT_AGENT_CMD: &str = "agent";
 const DEFAULT_SANDBOX: &str = "disabled";
 const DEFAULT_MAX_ADDRESS_ROUNDS: u32 = 3;
 const DEFAULT_STATE_DIR: &str = ".peal";
-const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 300;
+const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 1800;
 const DEFAULT_MAX_PARALLEL: u32 = 4;
 
 const ENV_PREFIX: &str = "PEAL_";
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(cfg.model, None);
         assert_eq!(cfg.max_address_rounds, 3);
         assert_eq!(cfg.state_dir, PathBuf::from(".peal"));
-        assert_eq!(cfg.phase_timeout_sec, 300);
+        assert_eq!(cfg.phase_timeout_sec, 1800);
         assert!(!cfg.parallel);
         assert_eq!(cfg.max_parallel, 4);
     }
@@ -688,7 +688,7 @@ repo_path = "/r"
         assert_eq!(cfg.agent_cmd, "agent");
         assert_eq!(cfg.sandbox, "disabled");
         assert_eq!(cfg.max_address_rounds, 3);
-        assert_eq!(cfg.phase_timeout_sec, 300);
+        assert_eq!(cfg.phase_timeout_sec, 1800);
         assert!(!cfg.parallel);
         assert_eq!(cfg.max_parallel, 4);
     }

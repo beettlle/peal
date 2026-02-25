@@ -37,4 +37,13 @@ pub enum PealError {
 
     #[error("Failed to parse environment variable '{var}': {detail}")]
     ConfigEnvParseError { var: String, detail: String },
+
+    #[error("Task {index} not found in plan (available: {available:?})")]
+    TaskNotFound { index: u32, available: Vec<u32> },
+
+    #[error("Failed to read state file {path}: {detail}")]
+    StateReadFailed { path: PathBuf, detail: String },
+
+    #[error("Failed to write state file {path}: {detail}")]
+    StateWriteFailed { path: PathBuf, detail: String },
 }

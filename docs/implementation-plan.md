@@ -152,13 +152,14 @@ flowchart LR
 | Subphase | Description | Can run in parallel with |
 | -------- | ----------- | ------------------------ |
 | **SP-4.1** | **Stet detection** — Before phase 3: resolve `stet` on PATH (in repo env or system). If not found, skip phase 3 for all tasks (not an error). Config: optional explicit stet path. | — |
-| **SP-4.2** | **Run stet sequence** — In repo: run configured sequence (e.g. `stet start [ref]`, `stet run`). Config: `stet_commands` (list) or single wrapper; `stet_start_ref` (e.g. `HEAD~1`). Capture stdout/stderr. Working directory = repo root. | SP-4.1 |
+| **SP-4.2** | **Start stet session** — In repo: run `stet start [ref]`. Config: `stet_start_ref` (e.g. `HEAD~1`). Capture stdout/stderr. Working directory = repo root. | SP-4.1 |
 | **SP-4.3** | **Findings heuristic** — Decide "findings present": from stet machine-readable output if available, else documented heuristic (e.g. exit code != 0 or pattern in stdout). | SP-4.2 |
-| **SP-4.4** | **Address-findings Cursor call** — If findings: invoke `agent --print --workspace <repo> ... "Address the following stet review findings. Apply fixes and run tests.\n\n{stet_output}"`. Capture output. | SP-4.3 |
-| **SP-4.5** | **Phase 3 loop** — After address: re-run `stet run` (no new `stet start` unless session finished). If findings remain and rounds < `max_address_rounds`: repeat address step; else configurable: fail task or warn and continue. Config: `max_address_rounds`, behavior on remaining findings. | SP-4.4 |
+| **SP-4.4** | **Address-findings Cursor call** — If findings: invoke `agent --print --workspace <repo> ... "Address the following stet review findings. Apply fixes and run tests.\n\n{stet_output}"`. If `suggestion` field is present in findings (from `stet fix` or `--suggest-fixes`), include it in the prompt. Capture output. | SP-4.3 |
+| **SP-4.5** | **Re-run and loop** — After address: run `stet run` (incremental check). If findings remain and rounds < `max_address_rounds`: repeat address step; else configurable: fail task or warn and continue. Config: `max_address_rounds`, behavior on remaining findings. | SP-4.4 |
 | **SP-4.6** | **Wire Phase 3 into runner** — After Phase 2 for a task: if stet found, run SP-4.2–SP-4.5; else skip. Integrate with sequential runner (and later with parallel block phase 3). | SP-4.5 |
+| **SP-4.7** | **Cleanup** — Run `stet finish` to persist state and remove the worktree. Run at the end of the task (or PEAL run). | SP-4.6 |
 
-**Parallelism:** Sequential chain SP-4.1 → SP-4.2 → SP-4.3 → SP-4.4 → SP-4.5 → SP-4.6; no parallel subphases within Phase 4.
+**Parallelism:** Sequential chain SP-4.1 → SP-4.2 → SP-4.3 → SP-4.4 → SP-4.5 → SP-4.6 → SP-4.7; no parallel subphases within Phase 4.
 
 ```mermaid
 flowchart LR
@@ -168,11 +169,13 @@ flowchart LR
   SP44[SP-4.4]
   SP45[SP-4.5]
   SP46[SP-4.6]
+  SP47[SP-4.7]
   SP41 --> SP42
   SP42 --> SP43
   SP43 --> SP44
   SP44 --> SP45
   SP45 --> SP46
+  SP46 --> SP47
 ```
 
 **Deliverable:** Full three-phase flow when stet is present; graceful skip when stet absent. Real stet binary used for development and optional integration tests.

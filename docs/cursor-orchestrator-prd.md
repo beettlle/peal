@@ -200,7 +200,9 @@ When stet is available, the orchestrator runs stet **in the target repository** 
   1. `stet start [ref]` — Start review from baseline. The ref (e.g. `HEAD~1` or a branch) SHALL be configurable; default MAY be current `HEAD` or user-configured.
   2. `stet run` — Re-run incremental review and produce findings.
 - Alternatively, the orchestrator MAY support a single **wrapper command** (e.g. a script or `stet start && stet run`) if the user's workflow is one command; the config key (e.g. `stet_commands` or `stet_run_script`) SHALL be defined so that either a list of commands or one wrapper can be specified.
-- **After "address findings":** To re-check, the orchestrator runs `stet run` again (no new `stet start` unless the session was finished). If the user's workflow uses `stet finish` between tasks, that SHALL be configurable (e.g. "after each task" vs. "once at end").
+- **After "address findings":** To re-check, the orchestrator runs `stet run` again (no new `stet start` unless the session was finished).
+- **Cleanup:** The orchestrator SHALL run `stet finish` at the end of the task (or run) to persist state and clean up the worktree.
+- **Optional Fixes:** If stet supports fix suggestions (e.g. via `stet fix` or `--suggest-fixes` in `stet start`), the orchestrator MAY include the suggested patch in the "address findings" prompt to the Cursor CLI.
 
 ### Capture and "findings present"
 
@@ -303,4 +305,3 @@ Rust is required. Subprocess output SHALL be read into standard types (e.g. `Str
 ### Adversarial development
 
 An optional phase may be added in a future revision where the orchestrator runs a **critical / adversarial pass** over the code produced in Phase 2 (execute). The purpose would be to have a model or separate step "attack" or critique the implementation—surfacing bugs, missing edge cases, security concerns, and design weaknesses—distinct from stet's defect-focused diff review. The output would be fed into the same "address findings" style flow (Cursor CLI with the critique in the prompt), with configurable placement (e.g. before stet, after stet, or when stet is not used) and a configurable max rounds. This would be opt-in via config (e.g. `adversarial: true`) and is not part of v1.
-

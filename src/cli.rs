@@ -53,7 +53,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
 
-    /// Per-phase timeout in seconds (default: 300).
+    /// Per-phase timeout in seconds (default: 1800 = 30 minutes).
     #[arg(long)]
     pub phase_timeout_sec: Option<u64>,
 
@@ -68,6 +68,14 @@ pub struct RunArgs {
     /// Maximum stet address-findings rounds per task (default: 3).
     #[arg(long)]
     pub max_address_rounds: Option<u32>,
+
+    /// Run only the task with this index.
+    #[arg(long, conflicts_with = "from_task")]
+    pub task: Option<u32>,
+
+    /// Run from this task index to the end of the plan.
+    #[arg(long, conflicts_with = "task")]
+    pub from_task: Option<u32>,
 
     /// Log level filter (default: "info"). Supports tracing directives
     /// (e.g. "debug", "peal=trace,warn"). Overridden by PEAL_LOG env var.
@@ -153,6 +161,42 @@ mod tests {
                 assert_eq!(args.max_address_rounds, Some(5));
             }
         }
+    }
+
+    #[test]
+    fn task_flag_parses() {
+        let cli = Cli::try_parse_from(["peal", "run", "--plan", "p.md", "--repo", "/r", "--task", "5"])
+            .expect("should parse --task");
+
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.task, Some(5));
+                assert_eq!(args.from_task, None);
+            }
+        }
+    }
+
+    #[test]
+    fn from_task_flag_parses() {
+        let cli = Cli::try_parse_from(["peal", "run", "--plan", "p.md", "--repo", "/r", "--from-task", "3"])
+            .expect("should parse --from-task");
+
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.task, None);
+                assert_eq!(args.from_task, Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn task_and_from_task_conflict() {
+        let result = Cli::try_parse_from([
+            "peal", "run", "--plan", "p.md", "--repo", "/r",
+            "--task", "1", "--from-task", "2",
+        ]);
+        let err = result.expect_err("--task and --from-task should conflict");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 
     #[test]

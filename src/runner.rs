@@ -12,6 +12,7 @@ use crate::config::PealConfig;
 use crate::error::PealError;
 use crate::phase::{self, PhaseOutput};
 use crate::plan::ParsedPlan;
+use crate::state::{self, PealState};
 
 /// The result of running Phase 1 for a single task.
 #[derive(Debug, Clone)]
@@ -30,13 +31,15 @@ pub struct TaskResult {
 
 /// Run Phase 1 (plan creation) for every task in order.
 ///
-/// On the first task failure the function returns the error immediately
-/// (no partial results, no state persistence).  Each successful invocation
-/// is logged with task index, duration, and plan-text length.
+/// On the first task failure, best-effort saves state then returns the
+/// error.  Each successful invocation is logged with task index, duration,
+/// and plan-text length.
 pub fn run_phase1_all(
     agent_path: &Path,
     config: &PealConfig,
     plan: &ParsedPlan,
+    peal_state: &mut PealState,
+    state_dir: &Path,
 ) -> Result<Vec<TaskPhase1Result>, PealError> {
     let task_count = plan.tasks.len();
     info!(task_count, "starting phase 1 for all tasks");
@@ -45,6 +48,17 @@ pub fn run_phase1_all(
 
     for (i, task) in plan.tasks.iter().enumerate() {
         let position = i + 1;
+
+        if peal_state.is_task_completed(task.index) {
+            info!(
+                task_index = task.index,
+                position,
+                task_count,
+                "skipping already-completed task {position}/{task_count}"
+            );
+            continue;
+        }
+
         info!(
             task_index = task.index,
             position,
@@ -63,6 +77,9 @@ pub fn run_phase1_all(
                     err = %e,
                     "phase 1 failed"
                 );
+                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                    error!(err = %save_err, "failed to save state after phase 1 failure");
+                }
                 e
             })?;
 
@@ -76,6 +93,9 @@ pub fn run_phase1_all(
             plan_text_len = output.stdout.len(),
             "phase 1 complete"
         );
+
+        peal_state.mark_task_completed(task.index);
+        state::save_state(peal_state, state_dir)?;
 
         results.push(TaskPhase1Result {
             task_index: task.index,
@@ -97,13 +117,15 @@ pub fn run_phase1_all(
 ///   1. Phase 1 (plan creation) — capture the plan text.
 ///   2. Phase 2 (execution)     — pass the plan text to the agent.
 ///
-/// On the first failure the function returns immediately (no state, no
-/// resume).  Each phase is logged with task index, duration, and output
-/// length.
+/// On success, marks the task completed in `peal_state` and persists to
+/// `state_dir`.  On failure, best-effort saves current state before
+/// returning the original error.
 pub fn run_all(
     agent_path: &Path,
     config: &PealConfig,
     plan: &ParsedPlan,
+    peal_state: &mut PealState,
+    state_dir: &Path,
 ) -> Result<Vec<TaskResult>, PealError> {
     let task_count = plan.tasks.len();
     info!(task_count, "starting sequential run (phase 1 → phase 2)");
@@ -112,6 +134,16 @@ pub fn run_all(
 
     for (i, task) in plan.tasks.iter().enumerate() {
         let position = i + 1;
+
+        if peal_state.is_task_completed(task.index) {
+            info!(
+                task_index = task.index,
+                position,
+                task_count,
+                "skipping already-completed task {position}/{task_count}"
+            );
+            continue;
+        }
 
         // -- Phase 1 --
         info!(
@@ -132,6 +164,9 @@ pub fn run_all(
                     err = %e,
                     "phase 1 failed"
                 );
+                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                    error!(err = %save_err, "failed to save state after phase 1 failure");
+                }
                 e
             })?;
 
@@ -165,6 +200,9 @@ pub fn run_all(
                     err = %e,
                     "phase 2 failed"
                 );
+                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                    error!(err = %save_err, "failed to save state after phase 2 failure");
+                }
                 e
             })?;
 
@@ -178,6 +216,9 @@ pub fn run_all(
             stdout_len = p2_output.stdout.len(),
             "phase 2 complete"
         );
+
+        peal_state.mark_task_completed(task.index);
+        state::save_state(peal_state, state_dir)?;
 
         results.push(TaskResult {
             task_index: task.index,
@@ -219,6 +260,10 @@ mod tests {
         }
     }
 
+    fn fresh_state() -> PealState {
+        PealState::new(PathBuf::from("plan.md"), PathBuf::from("/repo"))
+    }
+
     fn make_plan(tasks: Vec<Task>) -> ParsedPlan {
         let segments = tasks
             .iter()
@@ -236,6 +281,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![
             Task {
@@ -255,7 +302,7 @@ mod tests {
             },
         ]);
 
-        let results = run_phase1_all(&echo, &config, &plan).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].task_index, 1);
@@ -276,9 +323,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![]);
-        let results = run_phase1_all(&echo, &config, &plan).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert!(results.is_empty());
     }
@@ -304,6 +353,8 @@ mod tests {
 
         let false_path =
             crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![
             Task {
@@ -318,7 +369,7 @@ mod tests {
             },
         ]);
 
-        let err = run_phase1_all(&false_path, &config, &plan).unwrap_err();
+        let err = run_phase1_all(&false_path, &config, &plan, &mut state, &state_dir).unwrap_err();
 
         match err {
             PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 1),
@@ -331,6 +382,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![Task {
             index: 42,
@@ -338,7 +391,7 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_phase1_all(&echo, &config, &plan).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_index, 42);
@@ -350,6 +403,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![
             Task {
@@ -369,7 +424,7 @@ mod tests {
             },
         ]);
 
-        let results = run_phase1_all(&echo, &config, &plan).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![10, 20, 30]);
@@ -382,6 +437,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![
             Task {
@@ -396,7 +453,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].task_index, 1);
@@ -421,9 +478,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![]);
-        let results = run_all(&echo, &config, &plan).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert!(results.is_empty());
     }
@@ -449,6 +508,8 @@ mod tests {
 
         let false_path =
             crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![
             Task {
@@ -463,7 +524,7 @@ mod tests {
             },
         ]);
 
-        let err = run_all(&false_path, &config, &plan).unwrap_err();
+        let err = run_all(&false_path, &config, &plan, &mut state, &state_dir).unwrap_err();
 
         match err {
             PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 1),
@@ -476,6 +537,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![Task {
             index: 7,
@@ -483,7 +546,7 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_all(&echo, &config, &plan).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_index, 7);
@@ -496,6 +559,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![
             Task {
@@ -515,7 +580,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![10, 20, 30]);
@@ -526,6 +591,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
 
         let plan = make_plan(vec![Task {
             index: 1,
@@ -533,7 +600,7 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_all(&echo, &config, &plan).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
 
         assert!(
             results[0]
@@ -542,5 +609,208 @@ mod tests {
             "phase 2 output should contain plan delimiters: {:?}",
             results[0].phase2_stdout
         );
+    }
+
+    // -- State persistence integration tests --
+
+    #[test]
+    fn run_all_persists_state_with_all_task_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: false },
+            Task { index: 3, content: "C.".to_owned(), parallel: false },
+        ]);
+
+        run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist after run");
+        assert_eq!(loaded.completed_task_indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn run_all_on_failure_persists_only_completed_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".peal");
+
+        let echo = resolve_echo();
+        let false_path =
+            crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+
+        // Run first task successfully with echo, then simulate failure.
+        // We can't mix agents mid-run, so we use `false` for all tasks
+        // and expect zero completed tasks in state.
+        let config = PealConfig {
+            agent_cmd: "false".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            state_dir: state_dir.clone(),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+        };
+
+        let mut state = fresh_state();
+        let plan = make_plan(vec![
+            Task { index: 1, content: "Will fail.".to_owned(), parallel: false },
+            Task { index: 2, content: "Never reached.".to_owned(), parallel: false },
+        ]);
+
+        let _ = run_all(&false_path, &config, &plan, &mut state, &state_dir);
+
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist even on failure");
+        assert!(
+            loaded.completed_task_indices.is_empty(),
+            "no tasks should be completed since first task failed"
+        );
+
+        // Now run successfully with echo to verify partial completion.
+        let good_config = test_config(dir.path());
+        let plan2 = make_plan(vec![
+            Task { index: 10, content: "A.".to_owned(), parallel: false },
+            Task { index: 20, content: "B.".to_owned(), parallel: false },
+        ]);
+
+        let mut state2 = fresh_state();
+        run_all(&echo, &good_config, &plan2, &mut state2, &state_dir).unwrap();
+
+        let loaded2 = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist");
+        assert_eq!(loaded2.completed_task_indices, vec![10, 20]);
+    }
+
+    #[test]
+    fn run_all_creates_state_dir_if_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join("nested").join(".peal");
+        let mut state = fresh_state();
+
+        assert!(!state_dir.exists());
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "X.".to_owned(), parallel: false },
+        ]);
+
+        run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+
+        assert!(state_dir.join("state.json").exists());
+    }
+
+    // -- Resume semantics tests (SP-3.3) --
+
+    #[test]
+    fn run_all_skips_previously_completed_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+
+        let mut state = fresh_state();
+        state.mark_task_completed(1);
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "Already done.".to_owned(), parallel: false },
+            Task { index: 2, content: "Still pending.".to_owned(), parallel: false },
+            Task { index: 3, content: "Also pending.".to_owned(), parallel: false },
+        ]);
+
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![2, 3], "task 1 should be skipped");
+    }
+
+    #[test]
+    fn run_phase1_all_skips_previously_completed_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+
+        let mut state = fresh_state();
+        state.mark_task_completed(1);
+        state.mark_task_completed(2);
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "Done.".to_owned(), parallel: false },
+            Task { index: 2, content: "Done.".to_owned(), parallel: false },
+            Task { index: 3, content: "Pending.".to_owned(), parallel: false },
+        ]);
+
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![3], "tasks 1 and 2 should be skipped");
+    }
+
+    #[test]
+    fn run_all_all_completed_produces_empty_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+
+        let mut state = fresh_state();
+        state.mark_task_completed(1);
+        state.mark_task_completed(2);
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "Done.".to_owned(), parallel: false },
+            Task { index: 2, content: "Done.".to_owned(), parallel: false },
+        ]);
+
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+
+        assert!(results.is_empty(), "no tasks should run when all are completed");
+    }
+
+    #[test]
+    fn run_all_partial_completion_resumes_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+
+        // Simulate a previous run that completed tasks 1 and 2.
+        let mut state = fresh_state();
+        state.mark_task_completed(1);
+        state.mark_task_completed(2);
+        state::save_state(&state, &state_dir).unwrap();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: false },
+            Task { index: 3, content: "C.".to_owned(), parallel: false },
+            Task { index: 4, content: "D.".to_owned(), parallel: false },
+        ]);
+
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![3, 4], "should resume from task 3");
+
+        // Verify state now has all tasks completed.
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist");
+        assert_eq!(loaded.completed_task_indices, vec![1, 2, 3, 4]);
     }
 }

@@ -264,7 +264,7 @@ mod tests {
             model: model.map(|s| s.to_owned()),
             max_address_rounds: 3,
             state_dir: PathBuf::from(".peal"),
-            phase_timeout_sec: 300,
+            phase_timeout_sec: 1800,
             parallel: false,
             max_parallel: 4,
             log_level: None,

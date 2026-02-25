@@ -8,6 +8,7 @@ use peal::config::PealConfig;
 use peal::cursor;
 use peal::plan;
 use peal::runner;
+use peal::state;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -49,13 +50,71 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
             let parsed = plan::parse_plan_file(&config.plan_path)?;
 
+            let parsed = match (args.task, args.from_task) {
+                (Some(idx), None) => {
+                    info!(task_index = idx, "filtering plan to single task");
+                    parsed.filter_single_task(idx)?
+                }
+                (None, Some(idx)) => {
+                    info!(from_task = idx, "filtering plan from task onward");
+                    parsed.filter_from_task(idx)?
+                }
+                (None, None) => parsed,
+                _ => unreachable!("clap prevents both --task and --from-task"),
+            };
+
             info!(
                 task_count = parsed.tasks.len(),
                 segment_count = parsed.segments.len(),
                 "plan parsed"
             );
 
-            let results = runner::run_all(&agent_path, &config, &parsed)?;
+            let mut peal_state = match state::load_state(&config.state_dir)? {
+                Some(s) if s.matches_context(&config.plan_path, &config.repo_path) => {
+                    info!(
+                        completed = s.completed_task_indices.len(),
+                        "resumed from existing state"
+                    );
+                    s
+                }
+                Some(_) => {
+                    eprintln!(
+                        "warning: state file does not match current plan/repo paths; starting fresh"
+                    );
+                    info!("discarding stale state (plan_path or repo_path mismatch)");
+                    state::PealState::new(
+                        config.plan_path.clone(),
+                        config.repo_path.clone(),
+                    )
+                }
+                None => state::PealState::new(
+                    config.plan_path.clone(),
+                    config.repo_path.clone(),
+                ),
+            };
+
+            if !peal_state.completed_task_indices.is_empty() {
+                let completed: Vec<u32> = peal_state.completed_task_indices.clone();
+                let first_incomplete = parsed
+                    .tasks
+                    .iter()
+                    .find(|t| !peal_state.is_task_completed(t.index))
+                    .map(|t| t.index);
+
+                info!(
+                    ?completed,
+                    ?first_incomplete,
+                    "resume: previously completed tasks"
+                );
+            }
+
+            let results = runner::run_all(
+                &agent_path,
+                &config,
+                &parsed,
+                &mut peal_state,
+                &config.state_dir,
+            )?;
 
             for r in &results {
                 info!(
@@ -170,6 +229,78 @@ mod tests {
         .unwrap();
 
         run(cli).expect("should succeed when plan and repo come from config file");
+    }
+
+    #[test]
+    fn run_with_task_flag_runs_single_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(
+            &plan_path,
+            "## Task 1\nFirst\n\n## Task 2\nSecond\n\n## Task 3\nThird\n",
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "echo",
+            "--task",
+            "2",
+        ])
+        .unwrap();
+
+        run(cli).expect("--task 2 should succeed");
+
+        let loaded = peal::state::load_state(&dir.path().join(".peal"))
+            .unwrap()
+            .expect("state file should exist");
+        assert_eq!(
+            loaded.completed_task_indices,
+            vec![2],
+            "only task 2 should be marked completed"
+        );
+    }
+
+    #[test]
+    fn run_with_from_task_flag_runs_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(
+            &plan_path,
+            "## Task 1\nFirst\n\n## Task 2\nSecond\n\n## Task 3\nThird\n",
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "echo",
+            "--from-task",
+            "2",
+        ])
+        .unwrap();
+
+        run(cli).expect("--from-task 2 should succeed");
+
+        let loaded = peal::state::load_state(&dir.path().join(".peal"))
+            .unwrap()
+            .expect("state file should exist");
+        assert_eq!(
+            loaded.completed_task_indices,
+            vec![2, 3],
+            "tasks 2 and 3 should be marked completed"
+        );
     }
 
     #[test]

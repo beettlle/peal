@@ -96,6 +96,38 @@ pub fn parse_plan(content: &str) -> anyhow::Result<ParsedPlan> {
     Ok(ParsedPlan { tasks, segments })
 }
 
+impl ParsedPlan {
+    /// Return a new plan containing only the task with the given index.
+    ///
+    /// Segments are recomputed from the filtered task list.
+    pub fn filter_single_task(self, index: u32) -> Result<ParsedPlan, PealError> {
+        let available: Vec<u32> = self.tasks.iter().map(|t| t.index).collect();
+        let tasks: Vec<Task> = self.tasks.into_iter().filter(|t| t.index == index).collect();
+        if tasks.is_empty() {
+            return Err(PealError::TaskNotFound { index, available });
+        }
+        let segments = compute_segments(&tasks);
+        Ok(ParsedPlan { tasks, segments })
+    }
+
+    /// Return a new plan containing the task at `index` and all subsequent tasks.
+    ///
+    /// "Subsequent" means tasks whose position in the sorted plan is at or after
+    /// the target index. Segments are recomputed from the filtered task list.
+    pub fn filter_from_task(self, index: u32) -> Result<ParsedPlan, PealError> {
+        let available: Vec<u32> = self.tasks.iter().map(|t| t.index).collect();
+        let pos = self.tasks.iter().position(|t| t.index == index);
+        match pos {
+            None => Err(PealError::TaskNotFound { index, available }),
+            Some(start) => {
+                let tasks: Vec<Task> = self.tasks.into_iter().skip(start).collect();
+                let segments = compute_segments(&tasks);
+                Ok(ParsedPlan { tasks, segments })
+            }
+        }
+    }
+}
+
 /// Group an ordered task list into execution segments.
 ///
 /// Consecutive tasks with `parallel == true` form one `Segment::Parallel` block
@@ -449,5 +481,118 @@ G
             msg.contains("Invalid or missing plan file"),
             "expected file-not-found error, got: {msg}"
         );
+    }
+
+    // -- filter_single_task / filter_from_task tests --
+
+    fn make_plan_123() -> ParsedPlan {
+        parse_plan(
+            "## Task 1\nA\n\n## Task 2\nB\n\n## Task 3\nC\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn filter_single_task_returns_matching_task() {
+        let plan = make_plan_123().filter_single_task(2).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].index, 2);
+        assert_eq!(plan.segments, vec![Segment::Sequential(2)]);
+    }
+
+    #[test]
+    fn filter_single_task_not_found() {
+        let err = make_plan_123().filter_single_task(99).unwrap_err();
+        match err {
+            PealError::TaskNotFound { index, available } => {
+                assert_eq!(index, 99);
+                assert_eq!(available, vec![1, 2, 3]);
+            }
+            other => panic!("expected TaskNotFound, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_from_task_returns_tail() {
+        let plan = make_plan_123().filter_from_task(2).unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].index, 2);
+        assert_eq!(plan.tasks[1].index, 3);
+        assert_eq!(
+            plan.segments,
+            vec![Segment::Sequential(2), Segment::Sequential(3)]
+        );
+    }
+
+    #[test]
+    fn filter_from_task_not_found() {
+        let err = make_plan_123().filter_from_task(99).unwrap_err();
+        match err {
+            PealError::TaskNotFound { index, available } => {
+                assert_eq!(index, 99);
+                assert_eq!(available, vec![1, 2, 3]);
+            }
+            other => panic!("expected TaskNotFound, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_from_last_task_returns_single() {
+        let plan = make_plan_123().filter_from_task(3).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].index, 3);
+    }
+
+    #[test]
+    fn filter_from_task_recomputes_parallel_segments() {
+        let input = "\
+## Task 1
+A
+
+## Task 2 (parallel)
+B
+
+## Task 3 (parallel)
+C
+
+## Task 4
+D
+";
+        let plan = parse_plan(input).unwrap();
+        assert_eq!(plan.segments, vec![
+            Segment::Sequential(1),
+            Segment::Parallel(vec![2, 3]),
+            Segment::Sequential(4),
+        ]);
+
+        // Filtering from task 3 breaks the parallel block: task 3 alone becomes sequential.
+        let filtered = plan.filter_from_task(3).unwrap();
+        assert_eq!(filtered.tasks.len(), 2);
+        assert_eq!(
+            filtered.segments,
+            vec![Segment::Sequential(3), Segment::Sequential(4)]
+        );
+    }
+
+    /// Parses docs/plan-phase4.md, plan-phase5.md, plan-phase6.md and asserts
+    /// expected task counts and non-empty bodies.
+    #[test]
+    fn parse_docs_phase4_phase5_phase6_plan_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let plan4 = parse_plan_file(&root.join("docs/plan-phase4.md")).unwrap();
+        let plan5 = parse_plan_file(&root.join("docs/plan-phase5.md")).unwrap();
+        let plan6 = parse_plan_file(&root.join("docs/plan-phase6.md")).unwrap();
+        assert_eq!(plan4.tasks.len(), 6, "plan-phase4.md should have 6 tasks");
+        assert_eq!(plan5.tasks.len(), 5, "plan-phase5.md should have 5 tasks");
+        assert_eq!(plan6.tasks.len(), 3, "plan-phase6.md should have 3 tasks");
+        for t in &plan4.tasks {
+            assert!(!t.content.trim().is_empty(), "phase4 task {} has non-empty body", t.index);
+        }
+        for t in &plan5.tasks {
+            assert!(!t.content.trim().is_empty(), "phase5 task {} has non-empty body", t.index);
+        }
+        for t in &plan6.tasks {
+            assert!(!t.content.trim().is_empty(), "phase6 task {} has non-empty body", t.index);
+        }
     }
 }
