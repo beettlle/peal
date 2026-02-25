@@ -5,6 +5,7 @@ use tracing::{error, info};
 
 use peal::cli::{Cli, Commands};
 use peal::config::PealConfig;
+use peal::cursor;
 use peal::plan;
 
 fn main() -> ExitCode {
@@ -32,10 +33,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
             config.validate()?;
 
+            let agent_path = cursor::resolve_agent_cmd(&config.agent_cmd)?;
+
             info!(
                 plan = %config.plan_path.display(),
                 repo = %config.repo_path.display(),
                 agent_cmd = %config.agent_cmd,
+                agent_path = %agent_path.display(),
                 model = config.model.as_deref().unwrap_or("auto"),
                 parallel = config.parallel,
                 timeout_sec = config.phase_timeout_sec,
