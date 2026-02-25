@@ -55,13 +55,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 "plan parsed"
             );
 
-            let results = runner::run_phase1_all(&agent_path, &config, &parsed)?;
+            let results = runner::run_all(&agent_path, &config, &parsed)?;
 
             for r in &results {
                 info!(
                     task_index = r.task_index,
                     plan_text_len = r.plan_text.len(),
-                    "captured plan text"
+                    phase2_stdout_len = r.phase2_stdout.len(),
+                    "task complete"
                 );
             }
 
