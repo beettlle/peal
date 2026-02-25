@@ -121,7 +121,7 @@ impl PealConfig {
             Some(path) => load_file_layer(path)?,
             None => ConfigLayer::default(),
         };
-        let env_layer = load_env_layer(env_fn);
+        let env_layer = load_env_layer(env_fn)?;
         let cli_layer = cli_layer_from(cli_args);
 
         let merged = merge_layers(file_layer, env_layer, cli_layer);
@@ -188,8 +188,8 @@ fn real_env_var(suffix: &str) -> Option<String> {
     env::var(&key).ok().filter(|v| !v.is_empty())
 }
 
-fn load_env_layer(env_fn: fn(&str) -> Option<String>) -> ConfigLayer {
-    ConfigLayer {
+fn load_env_layer(env_fn: fn(&str) -> Option<String>) -> Result<ConfigLayer, crate::error::PealError> {
+    Ok(ConfigLayer {
         agent_cmd: env_fn("AGENT_CMD"),
         plan_path: env_fn("PLAN_PATH").map(PathBuf::from),
         repo_path: env_fn("REPO_PATH").map(PathBuf::from),
@@ -197,13 +197,58 @@ fn load_env_layer(env_fn: fn(&str) -> Option<String>) -> ConfigLayer {
             .map(|s| s.split(',').map(|c| c.trim().to_owned()).collect()),
         sandbox: env_fn("SANDBOX"),
         model: env_fn("MODEL"),
-        max_address_rounds: env_fn("MAX_ADDRESS_ROUNDS").and_then(|s| s.parse().ok()),
+        max_address_rounds: parse_env_u32(env_fn, "MAX_ADDRESS_ROUNDS")?,
         state_dir: env_fn("STATE_DIR").map(PathBuf::from),
-        phase_timeout_sec: env_fn("PHASE_TIMEOUT_SEC").and_then(|s| s.parse().ok()),
-        parallel: env_fn("PARALLEL").and_then(|s| s.parse().ok()),
-        max_parallel: env_fn("MAX_PARALLEL").and_then(|s| s.parse().ok()),
+        phase_timeout_sec: parse_env_u64(env_fn, "PHASE_TIMEOUT_SEC")?,
+        parallel: parse_env_bool(env_fn, "PARALLEL")?,
+        max_parallel: parse_env_u32(env_fn, "MAX_PARALLEL")?,
         log_level: env_fn("LOG_LEVEL"),
         log_file: env_fn("LOG_FILE").map(PathBuf::from),
+    })
+}
+
+fn parse_env_u32(
+    env_fn: fn(&str) -> Option<String>,
+    suffix: &str,
+) -> Result<Option<u32>, crate::error::PealError> {
+    match env_fn(suffix) {
+        Some(s) => s.parse::<u32>().map(Some).map_err(|e| {
+            crate::error::PealError::ConfigEnvParseError {
+                var: format!("{ENV_PREFIX}{suffix}"),
+                detail: e.to_string(),
+            }
+        }),
+        None => Ok(None),
+    }
+}
+
+fn parse_env_u64(
+    env_fn: fn(&str) -> Option<String>,
+    suffix: &str,
+) -> Result<Option<u64>, crate::error::PealError> {
+    match env_fn(suffix) {
+        Some(s) => s.parse::<u64>().map(Some).map_err(|e| {
+            crate::error::PealError::ConfigEnvParseError {
+                var: format!("{ENV_PREFIX}{suffix}"),
+                detail: e.to_string(),
+            }
+        }),
+        None => Ok(None),
+    }
+}
+
+fn parse_env_bool(
+    env_fn: fn(&str) -> Option<String>,
+    suffix: &str,
+) -> Result<Option<bool>, crate::error::PealError> {
+    match env_fn(suffix) {
+        Some(s) => s.parse::<bool>().map(Some).map_err(|e| {
+            crate::error::PealError::ConfigEnvParseError {
+                var: format!("{ENV_PREFIX}{suffix}"),
+                detail: e.to_string(),
+            }
+        }),
+        None => Ok(None),
     }
 }
 
@@ -693,5 +738,27 @@ sandbox = "file-sandbox"
         assert_eq!(cfg.model.as_deref(), Some("env-model"), "env > file");
         assert_eq!(cfg.sandbox, "file-sandbox", "file used when no env/cli");
         assert_eq!(cfg.plan_path, PathBuf::from("file.md"), "file fallback");
+    }
+
+    #[test]
+    fn invalid_env_var_returns_error() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "MAX_PARALLEL" {
+                Some("not-a-number".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let err = PealConfig::load_with_env(None, &args, fake_env).unwrap_err();
+        assert!(
+            format!("{err}").contains("Failed to parse environment variable"),
+            "unexpected: {err}"
+        );
+        assert!(
+            format!("{err}").contains("PEAL_MAX_PARALLEL"),
+            "should mention the variable name"
+        );
     }
 }

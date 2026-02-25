@@ -51,6 +51,10 @@ pub fn phase1(task_content: &str) -> String {
 ///
 /// The plan text is wrapped in `---PLAN---` delimiters so the agent can
 /// distinguish the plan content from the instruction envelope.
+///
+/// Note: We use `PLAN_DELIMITER` here specifically to distinguish from
+/// `TASK_DELIMITER` (Phase 1) and `STET_DELIMITER` (Phase 3). This helps
+/// the agent understand the context of the input data.
 pub fn phase2(plan_text: &str) -> String {
     format!(
         "Execute the following plan. Do not re-plan; only implement and test.\n\n\

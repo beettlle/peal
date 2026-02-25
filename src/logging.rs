@@ -79,6 +79,8 @@ fn build_filter(log_level: Option<&str>) -> EnvFilter {
 
 fn open_log_file(path: &Path) -> anyhow::Result<std::fs::File> {
     if let Some(parent) = path.parent() {
+        // If parent is empty (e.g. "peal.log"), it means current directory.
+        // fs::create_dir_all("") would fail, but we don't need to create anything.
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 anyhow::anyhow!(

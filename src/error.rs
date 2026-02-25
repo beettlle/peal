@@ -34,4 +34,7 @@ pub enum PealError {
         exit_code: Option<i32>,
         stderr: String,
     },
+
+    #[error("Failed to parse environment variable '{var}': {detail}")]
+    ConfigEnvParseError { var: String, detail: String },
 }

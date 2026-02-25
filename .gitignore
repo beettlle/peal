@@ -33,3 +33,5 @@ peal.local.toml
 # Added by cargo
 
 /target
+# binary
+peal

@@ -76,6 +76,13 @@ pub fn run_command<S: AsRef<OsStr>>(
 
 /// Wait for the child to exit. If `timeout` is `Some`, poll with `try_wait`
 /// and kill the child when the deadline is exceeded.
+///
+/// # Race Condition Note
+///
+/// There is a theoretical race where the child exits successfully just as we
+/// decide to kill it due to timeout. In this case, we might report a timeout
+/// even if the process finished. This is acceptable for our use case: if it's
+/// that close to the timeout, treating it as a timeout is safe.
 fn wait_with_timeout(
     child: &mut Child,
     timeout: Option<Duration>,
