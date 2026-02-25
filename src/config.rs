@@ -33,6 +33,8 @@ pub struct PealConfig {
     pub phase_timeout_sec: u64,
     pub parallel: bool,
     pub max_parallel: u32,
+    pub log_level: Option<String>,
+    pub log_file: Option<PathBuf>,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -50,6 +52,8 @@ struct FileConfig {
     phase_timeout_sec: Option<u64>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
+    log_level: Option<String>,
+    log_file: Option<PathBuf>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -66,6 +70,8 @@ struct ConfigLayer {
     phase_timeout_sec: Option<u64>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
+    log_level: Option<String>,
+    log_file: Option<PathBuf>,
 }
 
 impl PealConfig {
@@ -122,6 +128,8 @@ impl PealConfig {
                 .unwrap_or(DEFAULT_PHASE_TIMEOUT_SEC),
             parallel: merged.parallel.unwrap_or(false),
             max_parallel: merged.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL),
+            log_level: merged.log_level,
+            log_file: merged.log_file,
         })
     }
 }
@@ -143,6 +151,8 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         phase_timeout_sec: fc.phase_timeout_sec,
         parallel: fc.parallel,
         max_parallel: fc.max_parallel,
+        log_level: fc.log_level,
+        log_file: fc.log_file,
     })
 }
 
@@ -165,6 +175,8 @@ fn load_env_layer(env_fn: fn(&str) -> Option<String>) -> ConfigLayer {
         phase_timeout_sec: env_fn("PHASE_TIMEOUT_SEC").and_then(|s| s.parse().ok()),
         parallel: env_fn("PARALLEL").and_then(|s| s.parse().ok()),
         max_parallel: env_fn("MAX_PARALLEL").and_then(|s| s.parse().ok()),
+        log_level: env_fn("LOG_LEVEL"),
+        log_file: env_fn("LOG_FILE").map(PathBuf::from),
     }
 }
 
@@ -180,7 +192,9 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         parallel: if args.parallel { Some(true) } else { None },
         max_parallel: args.max_parallel,
         max_address_rounds: args.max_address_rounds,
-        stet_commands: None, // stet_commands only from file/env; not practical as CLI arg
+        stet_commands: None,
+        log_level: args.log_level.clone(),
+        log_file: args.log_file.clone(),
     }
 }
 
@@ -210,6 +224,8 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .max_parallel
             .or(env.max_parallel)
             .or(file.max_parallel),
+        log_level: cli.log_level.or(env.log_level).or(file.log_level),
+        log_file: cli.log_file.or(env.log_file).or(file.log_file),
     }
 }
 
@@ -234,6 +250,8 @@ mod tests {
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            log_level: None,
+            log_file: None,
         }
     }
 
@@ -339,6 +357,8 @@ model = "from-file"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            log_level: None,
+            log_file: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
 
@@ -397,6 +417,8 @@ agent_cmd = "from-file"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            log_level: None,
+            log_file: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
 
@@ -481,6 +503,8 @@ bogus_key = true
             parallel: true,
             max_parallel: Some(2),
             max_address_rounds: None,
+            log_level: None,
+            log_file: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
 
@@ -548,6 +572,8 @@ sandbox = "file-sandbox"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            log_level: None,
+            log_file: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
 

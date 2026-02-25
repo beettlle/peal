@@ -68,6 +68,16 @@ pub struct RunArgs {
     /// Maximum stet address-findings rounds per task (default: 3).
     #[arg(long)]
     pub max_address_rounds: Option<u32>,
+
+    /// Log level filter (default: "info"). Supports tracing directives
+    /// (e.g. "debug", "peal=trace,warn"). Overridden by PEAL_LOG env var.
+    #[arg(long)]
+    pub log_level: Option<String>,
+
+    /// Path to a log file. When set, structured JSON logs are appended here
+    /// in addition to the human-readable stderr output.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
 }
 
 #[cfg(test)]

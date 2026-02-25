@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
+use tracing::{error, info};
 
 use peal::cli::{Cli, Commands};
 use peal::config::PealConfig;
@@ -12,7 +13,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("peal: {e:#}");
+            error!("{e:#}");
             ExitCode::FAILURE
         }
     }
@@ -22,8 +23,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::Run(args) => {
             let config_path = args.config.clone();
-            let config =
-                PealConfig::load(config_path.as_deref(), &args)?;
+            let config = PealConfig::load(config_path.as_deref(), &args)?;
+
+            peal::logging::init(
+                config.log_level.as_deref(),
+                config.log_file.as_deref(),
+            )?;
 
             if !config.plan_path.exists() {
                 return Err(PealError::PlanFileNotFound {
@@ -50,16 +55,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .into());
             }
 
-            eprintln!(
-                "peal: plan={} repo={} agent_cmd={} model={} parallel={} timeout={}s",
-                config.plan_path.display(),
-                config.repo_path.display(),
-                config.agent_cmd,
-                config.model.as_deref().unwrap_or("auto"),
-                config.parallel,
-                config.phase_timeout_sec,
+            info!(
+                plan = %config.plan_path.display(),
+                repo = %config.repo_path.display(),
+                agent_cmd = %config.agent_cmd,
+                model = config.model.as_deref().unwrap_or("auto"),
+                parallel = config.parallel,
+                timeout_sec = config.phase_timeout_sec,
+                "config loaded"
             );
-            eprintln!("peal: config loaded, ready for execution (no behavior yet)");
 
             Ok(())
         }
