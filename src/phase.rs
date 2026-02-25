@@ -88,6 +88,73 @@ fn phase1_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
     args
 }
 
+/// Run Phase 2 (plan execution) for a single task.
+///
+/// Builds the prompt via `prompt::phase2`, constructs the `agent` argv
+/// (no `--plan` flag, includes `--sandbox`), invokes the subprocess, and
+/// returns the captured output.  On timeout or non-zero exit, returns an error.
+pub fn run_phase2(
+    agent_path: &Path,
+    config: &PealConfig,
+    task_index: u32,
+    plan_text: &str,
+) -> Result<PhaseOutput, PealError> {
+    let prompt = prompt::phase2(plan_text);
+    let args = phase2_argv(config, &prompt);
+    let timeout = Duration::from_secs(config.phase_timeout_sec);
+
+    let agent_str = agent_path.to_string_lossy();
+
+    info!(
+        phase = 2,
+        task_index,
+        agent = %agent_str,
+        timeout_sec = config.phase_timeout_sec,
+        "invoking phase 2"
+    );
+    debug!(phase = 2, task_index, ?args, "phase 2 argv");
+
+    let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
+        .map_err(|e| PealError::PhaseSpawnFailed {
+            phase: 2,
+            detail: e.to_string(),
+        })?;
+
+    check_result(2, task_index, config.phase_timeout_sec, &result)?;
+
+    Ok(PhaseOutput {
+        stdout: result.stdout,
+        stderr: result.stderr,
+    })
+}
+
+/// Build the argv (excluding the program name) for a Phase 2 invocation.
+///
+/// Layout:
+/// ```text
+/// --print --workspace <repo> --sandbox <sandbox> [--model <m>] <prompt>
+/// ```
+///
+/// Phase 2 omits `--plan` (execution, not planning) and includes
+/// `--sandbox` from config.
+fn phase2_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        "--print".to_owned(),
+        "--workspace".to_owned(),
+        config.repo_path.to_string_lossy().into_owned(),
+        "--sandbox".to_owned(),
+        config.sandbox.clone(),
+    ];
+
+    if let Some(ref model) = config.model {
+        args.push("--model".to_owned());
+        args.push(model.clone());
+    }
+
+    args.push(prompt.to_owned());
+    args
+}
+
 /// Validate a `CommandResult`, returning an error on timeout or non-zero exit.
 fn check_result(
     phase: u32,
@@ -254,6 +321,80 @@ mod tests {
         }
     }
 
+    // -- Phase 2 argv construction tests --
+
+    #[test]
+    fn phase2_argv_without_model() {
+        let config = test_config(None);
+        let args = phase2_argv(&config, "Execute this plan.");
+
+        assert_eq!(
+            args,
+            vec![
+                "--print",
+                "--workspace",
+                "/my/repo",
+                "--sandbox",
+                "disabled",
+                "Execute this plan.",
+            ]
+        );
+    }
+
+    #[test]
+    fn phase2_argv_with_model() {
+        let config = test_config(Some("claude-4-opus"));
+        let args = phase2_argv(&config, "Execute this plan.");
+
+        assert_eq!(
+            args,
+            vec![
+                "--print",
+                "--workspace",
+                "/my/repo",
+                "--sandbox",
+                "disabled",
+                "--model",
+                "claude-4-opus",
+                "Execute this plan.",
+            ]
+        );
+    }
+
+    #[test]
+    fn phase2_argv_prompt_is_last_arg() {
+        let config = test_config(Some("gpt-5"));
+        let prompt_text = "Execute the following plan. Do not re-plan; only implement and test.";
+        let args = phase2_argv(&config, prompt_text);
+
+        assert_eq!(
+            args.last().unwrap(),
+            prompt_text,
+            "prompt must be the final positional arg"
+        );
+    }
+
+    #[test]
+    fn phase2_argv_does_not_contain_plan_flag() {
+        let config = test_config(Some("model"));
+        let args = phase2_argv(&config, "prompt");
+
+        assert!(
+            !args.contains(&"--plan".to_owned()),
+            "phase 2 must not include --plan flag"
+        );
+    }
+
+    #[test]
+    fn phase2_argv_includes_sandbox() {
+        let mut config = test_config(None);
+        config.sandbox = "enabled".to_owned();
+        let args = phase2_argv(&config, "prompt");
+
+        let sandbox_idx = args.iter().position(|a| a == "--sandbox").unwrap();
+        assert_eq!(args[sandbox_idx + 1], "enabled");
+    }
+
     // -- Integration-style tests using real binaries --
 
     #[test]
@@ -391,6 +532,112 @@ mod tests {
                 assert!(!detail.is_empty());
             }
             other => panic!("expected PhaseSpawnFailed, got: {other:?}"),
+        }
+    }
+
+    // -- Phase 2 integration-style tests --
+
+    #[test]
+    fn run_phase2_with_echo_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "echo".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+        };
+
+        let echo_path = PathBuf::from("/bin/echo");
+        let actual_echo = if echo_path.exists() {
+            echo_path
+        } else {
+            crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
+        };
+
+        let output = run_phase2(&actual_echo, &config, 1, "1. Build widget\n2. Test it").unwrap();
+
+        assert!(
+            output.stdout.contains("Execute the following plan"),
+            "stdout should contain the phase 2 instruction: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("---PLAN---"),
+            "stdout should contain the plan delimiter: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("1. Build widget"),
+            "stdout should contain the plan text: {:?}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn run_phase2_fails_on_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "false".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+        };
+
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let err = run_phase2(&false_path, &config, 1, "plan text").unwrap_err();
+
+        match err {
+            PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 2),
+            other => panic!("expected PhaseNonZeroExit for phase 2, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_phase2_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "nonexistent".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+        };
+
+        let bad_path = PathBuf::from("/no/such/binary");
+        let err = run_phase2(&bad_path, &config, 1, "plan text").unwrap_err();
+
+        match err {
+            PealError::PhaseSpawnFailed { phase, detail } => {
+                assert_eq!(phase, 2);
+                assert!(!detail.is_empty());
+            }
+            other => panic!("expected PhaseSpawnFailed for phase 2, got: {other:?}"),
         }
     }
 }
