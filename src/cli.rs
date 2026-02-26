@@ -76,6 +76,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub max_parallel: Option<u32>,
 
+    /// On task failure in a parallel block: continue with remaining segments and exit 0.
+    #[arg(long, default_value_t = false)]
+    pub continue_with_remaining_tasks: bool,
+
     /// Maximum stet address-findings rounds per task (default: 3).
     #[arg(long)]
     pub max_address_rounds: Option<u32>,
@@ -190,6 +194,7 @@ mod tests {
             "HEAD~1",
             "--stet-start-args=--allow-dirty",
             "--stet-run-args=--verify --context 256k",
+            "--continue-with-remaining-tasks",
         ])
         .expect("should parse all flags");
 
@@ -203,6 +208,7 @@ mod tests {
                 assert_eq!(args.phase_timeout_sec, Some(600));
                 assert!(args.parallel);
                 assert_eq!(args.max_parallel, Some(8));
+                assert!(args.continue_with_remaining_tasks);
                 assert_eq!(args.max_address_rounds, Some(5));
                 assert_eq!(args.stet_start_ref.as_deref(), Some("HEAD~1"));
                 assert_eq!(args.stet_start_args.as_deref(), Some("--allow-dirty"));

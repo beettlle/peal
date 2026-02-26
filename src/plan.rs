@@ -120,6 +120,12 @@ pub fn parse_plan(content: &str) -> anyhow::Result<ParsedPlan> {
 }
 
 impl ParsedPlan {
+    /// Execution schedule (SP-5.1): ordered segments defining run order and parallel blocks.
+    /// Sequential segment = one task index; parallel block = set of task indices run together.
+    pub fn execution_schedule(&self) -> &[Segment] {
+        &self.segments
+    }
+
     /// Look up a task by its index. O(n) scan, fine for typical plan sizes (<50 tasks).
     pub fn task_by_index(&self, index: u32) -> Option<&Task> {
         self.tasks.iter().find(|t| t.index == index)
@@ -473,6 +479,8 @@ G
                 Segment::Parallel(vec![5, 6, 7]),
             ]
         );
+        // SP-5.1: execution_schedule() is the single source for run order.
+        assert_eq!(plan.execution_schedule(), plan.segments.as_slice());
     }
 
     // -- File-level tests --

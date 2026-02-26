@@ -3,10 +3,11 @@
 //! SP-1.6: run Phase 1 for every task in order, capture plan text, log results.
 //! SP-2.2: sequential runner — Phase 1 → Phase 2 per task, fail-fast.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::PealConfig;
 use crate::error::PealError;
@@ -320,6 +321,9 @@ fn run_phases_1_2(
 
 /// Run Phase 1 → Phase 2 concurrently for a batch of pending tasks.
 ///
+/// One execution stream per task (Phase 1 → Phase 2); streams are joined before
+/// the caller runs Phase 3; no shared mutable state.
+///
 /// Tasks are chunked into groups of `max_concurrent`; within each chunk,
 /// scoped threads run one task each. After all threads in a chunk join,
 /// results are partitioned into successes and failures. Processing stops
@@ -373,9 +377,10 @@ fn run_parallel_block(
     (successes, failures)
 }
 
-/// Segment-aware execution scheduler.
+/// Segment-aware execution scheduler (SP-5.1).
 ///
-/// Iterates over `plan.segments` instead of `plan.tasks` directly:
+/// Execution order is derived solely from `plan.execution_schedule()` (i.e. `plan.segments`):
+/// segment 1, then 2, … (sequential segments and parallel blocks in sequence).
 /// - `Sequential(idx)` — runs the single task through P1 → P2 → P3.
 /// - `Parallel(indices)` — when `config.parallel` is true and more than one
 ///   task is pending, runs P1 → P2 concurrently via `std::thread::scope`,
@@ -394,9 +399,10 @@ pub fn run_scheduled(
 ) -> Result<Vec<TaskResult>, PealError> {
     let task_count = plan.tasks.len();
     let phase3_available = stet_path.is_some();
+    let schedule = plan.execution_schedule();
     info!(
         task_count,
-        segment_count = plan.segments.len(),
+        segment_count = schedule.len(),
         phase3_available,
         "starting scheduled run"
     );
@@ -404,7 +410,7 @@ pub fn run_scheduled(
     let mut results: Vec<TaskResult> = Vec::with_capacity(task_count);
     let mut position: usize = 0;
 
-    for segment in &plan.segments {
+    for segment in schedule {
         match segment {
             crate::plan::Segment::Sequential(idx) => {
                 let idx = *idx;
@@ -448,8 +454,8 @@ pub fn run_scheduled(
                     continue;
                 }
 
-                if config.parallel && pending.len() > 1 {
-                    // -- Concurrent path (SP-5.2) --
+                if config.parallel && pending.len() > 1 && config.max_parallel > 1 {
+                    // -- Concurrent path (SP-5.2). All Phase 2s in the block complete before any Phase 3 runs. --
                     let max_concurrent = (config.max_parallel as usize).max(1);
 
                     info!(
@@ -473,77 +479,125 @@ pub fn run_scheduled(
                         state::save_state(peal_state, state_dir)?;
                     }
 
-                    // Phase 3 sequentially for each successful task (no concurrent stet).
-                    for (idx, plan_text, phase2_stdout) in successes {
+                    // Phase 3 sequentially in block task order (segment indices order).
+                    let mut successes_by_index: HashMap<u32, (String, String)> = successes
+                        .into_iter()
+                        .map(|(idx, plan_text, phase2_stdout)| (idx, (plan_text, phase2_stdout)))
+                        .collect();
+
+                    let mut phase3_count = 0usize;
+                    let mut phase3_continued_after_failure = false;
+                    for idx in indices {
+                        let Some((plan_text, phase2_stdout)) = successes_by_index.remove(&idx) else {
+                            continue;
+                        };
+                        phase3_count += 1;
                         position += 1;
 
-                        let phase3_outcome = if let Some(sp) = stet_path {
-                            let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+                        let phase3_result: Result<Option<stet::AddressLoopOutcome>, PealError> =
+                            (|| {
+                                if let Some(sp) = stet_path {
+                                    let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
 
-                            info!(
-                                task_index = idx,
-                                position, task_count,
-                                "phase 3: running stet review"
-                            );
+                                    info!(
+                                        task_index = idx,
+                                        position, task_count,
+                                        "phase 3: running stet review"
+                                    );
 
-                            let stet_result = stet::run_review(
-                                sp,
-                                &config.repo_path,
-                                &config.stet_run_extra_args,
-                                timeout,
-                            )
-                                .map_err(|e| {
-                                    error!(task_index = idx, err = %e, "stet run failed");
-                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                                        error!(err = %save_err, "failed to save state after stet failure");
+                                    let stet_result = stet::run_review(
+                                        sp,
+                                        &config.repo_path,
+                                        &config.stet_run_extra_args,
+                                        timeout,
+                                    )
+                                        .map_err(|e| {
+                                            error!(task_index = idx, err = %e, "stet run failed");
+                                            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                error!(err = %save_err, "failed to save state after stet failure");
+                                            }
+                                            e
+                                        })?;
+
+                                    if stet_result.has_findings {
+                                        info!(task_index = idx, "phase 3: findings detected, starting address loop");
+
+                                        let outcome = stet::address_loop(agent_path, sp, config, idx, &stet_result)
+                                            .map_err(|e| {
+                                                error!(task_index = idx, err = %e, "address loop failed");
+                                                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                    error!(err = %save_err, "failed to save state after address failure");
+                                                }
+                                                e
+                                            })?;
+
+                                        info!(
+                                            task_index = idx,
+                                            rounds = outcome.rounds_used,
+                                            resolved = outcome.findings_resolved,
+                                            "phase 3 complete"
+                                        );
+                                        Ok(Some(outcome))
+                                    } else {
+                                        info!(task_index = idx, "phase 3: no findings, skipping address loop");
+                                        Ok(Some(stet::AddressLoopOutcome {
+                                            rounds_used: 0,
+                                            findings_resolved: true,
+                                            last_stet_result: stet_result,
+                                        }))
                                     }
-                                    e
-                                })?;
+                                } else {
+                                    Ok(None)
+                                }
+                            })();
 
-                            if stet_result.has_findings {
-                                info!(task_index = idx, "phase 3: findings detected, starting address loop");
-
-                                let outcome = stet::address_loop(agent_path, sp, config, idx, &stet_result)
-                                    .map_err(|e| {
-                                        error!(task_index = idx, err = %e, "address loop failed");
-                                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                                            error!(err = %save_err, "failed to save state after address failure");
-                                        }
-                                        e
-                                    })?;
-
-                                info!(
-                                    task_index = idx,
-                                    rounds = outcome.rounds_used,
-                                    resolved = outcome.findings_resolved,
-                                    "phase 3 complete"
-                                );
-                                Some(outcome)
-                            } else {
-                                info!(task_index = idx, "phase 3: no findings, skipping address loop");
-                                Some(stet::AddressLoopOutcome {
-                                    rounds_used: 0,
-                                    findings_resolved: true,
-                                    last_stet_result: stet_result,
-                                })
+                        match phase3_result {
+                            Ok(phase3_outcome) => {
+                                results.push(TaskResult {
+                                    task_index: idx,
+                                    plan_text,
+                                    phase2_stdout,
+                                    phase3_outcome,
+                                });
                             }
-                        } else {
-                            None
-                        };
-
-                        results.push(TaskResult {
-                            task_index: idx,
-                            plan_text,
-                            phase2_stdout,
-                            phase3_outcome,
-                        });
+                            Err(e) => {
+                                if config.continue_with_remaining_tasks {
+                                    warn!(
+                                        task_index = idx,
+                                        err = %e,
+                                        "phase 3 failed in parallel block; continuing with remaining segments"
+                                    );
+                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                        error!(err = %save_err, "failed to save state after phase 3 failure");
+                                    }
+                                    position += indices.len() - phase3_count;
+                                    phase3_continued_after_failure = true;
+                                    break;
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
                     }
 
                     let completed_in_block = indices.len() - pending.len();
-                    position += completed_in_block + failures.len();
+                    if !phase3_continued_after_failure {
+                        position += completed_in_block + failures.len();
+                    }
 
-                    if let Some((_idx, err)) = failures.into_iter().next() {
-                        return Err(err);
+                    if !failures.is_empty() {
+                        for (fail_idx, err) in &failures {
+                            warn!(
+                                task_index = fail_idx,
+                                err = %err,
+                                "task failed in parallel block (P1/P2)"
+                            );
+                        }
+                        if !config.continue_with_remaining_tasks {
+                            if let Some((_idx, err)) = failures.into_iter().next() {
+                                return Err(err);
+                            }
+                        }
                     }
                 } else {
                     // -- Sequential fallback --
@@ -621,6 +675,7 @@ mod tests {
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -718,6 +773,7 @@ mod tests {
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -884,6 +940,7 @@ mod tests {
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1062,6 +1119,7 @@ mod tests {
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1118,6 +1176,64 @@ mod tests {
             .unwrap()
             .expect("state file should exist");
         assert_eq!(loaded2.completed_task_indices, vec![10, 20]);
+    }
+
+    /// SP-5.4: max_parallel == 1 forces sequential fallback for a parallel block.
+    #[test]
+    fn max_parallel_eq_1_uses_sequential_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config_parallel(dir.path());
+        config.max_parallel = 1;
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: true },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![1, 2, 3], "max_parallel=1 runs block sequentially in order");
+    }
+
+    /// SP-5.4: continue_with_remaining_tasks=true → one failure in block persists completed, returns Ok.
+    #[test]
+    fn continue_with_remaining_tasks_true_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".peal");
+        let echo = resolve_echo();
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+
+        // Complete task 1 first.
+        let mut config = test_config_parallel(dir.path());
+        let mut state = fresh_state();
+        let plan1 = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+        ]);
+        run_scheduled(&echo, &config, &plan1, &mut state, &state_dir, None).unwrap();
+        assert!(state.is_task_completed(1));
+
+        // Run with parallel block (2, 3) that will fail; continue_with_remaining_tasks = true.
+        config.agent_cmd = "false".to_owned();
+        config.continue_with_remaining_tasks = true;
+        let plan2 = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        let result = run_scheduled(&false_path, &config, &plan2, &mut state, &state_dir, None);
+        assert!(result.is_ok(), "continue_with_remaining_tasks=true should return Ok: {:?}", result.err());
+
+        let loaded = state::load_state(&state_dir).unwrap().expect("state file should exist");
+        assert!(loaded.is_task_completed(1), "task 1 should remain completed");
+        assert!(!loaded.is_task_completed(2));
+        assert!(!loaded.is_task_completed(3));
     }
 
     #[test]
@@ -1532,8 +1648,44 @@ mod tests {
         assert_eq!(indices, vec![3, 4], "task 2 already done; only 3 and 4 should run");
     }
 
+    /// SP-5.5: Resume into parallel block exercises the concurrent path (P1+P2 in parallel, P3 in segment order).
+    /// Plan: sequential 1, parallel block (2, 3, 4). Resume with 1 and 2 completed; only 3 and 4 run.
     #[test]
-    fn scheduled_single_parallel_task_demoted_to_sequential() {
+    fn scheduled_resume_parallel_block_concurrent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_parallel(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+
+        let mut state = fresh_state();
+        state.mark_task_completed(1);
+        state.mark_task_completed(2);
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+            Task { index: 4, content: "D.".to_owned(), parallel: true },
+        ]);
+
+        assert_eq!(
+            plan.segments,
+            vec![Segment::Sequential(1), Segment::Parallel(vec![2, 3, 4])]
+        );
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![3, 4], "only pending tasks 3 and 4 in block should run; results in segment order");
+
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist");
+        assert_eq!(
+            loaded.completed_task_indices,
+            vec![1, 2, 3, 4],
+            "all four tasks should be completed after run"
+        );
+    }
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
@@ -1603,6 +1755,7 @@ mod tests {
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1749,6 +1902,34 @@ mod tests {
         let mut indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         indices.sort();
         assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    /// SP-5.3: Phase 3 runs in block task order (segment order), not thread completion order.
+    #[test]
+    fn parallel_block_phase3_in_segment_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_parallel(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: true },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+
+        assert_eq!(results.len(), 3);
+        let result_order: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(
+            result_order,
+            vec![1, 2, 3],
+            "parallel block results must be in segment (block task) order, not completion order"
+        );
     }
 
     #[test]
