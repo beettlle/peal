@@ -111,16 +111,157 @@ pub fn run_phase1_all(
     Ok(results)
 }
 
-/// Run the full sequential pipeline (Phase 1 → Phase 2) for every task.
+/// Run Phase 1 → Phase 2 → Phase 3 for a single task, mark it completed, and
+/// persist state. Extracted from the per-task body so both sequential and
+/// parallel segment branches can reuse it.
+fn run_single_task(
+    agent_path: &Path,
+    config: &PealConfig,
+    task: &crate::plan::Task,
+    peal_state: &mut PealState,
+    state_dir: &Path,
+    stet_path: Option<&Path>,
+    task_count: usize,
+    position: usize,
+) -> Result<TaskResult, PealError> {
+    // -- Phase 1 --
+    info!(
+        task_index = task.index,
+        position, task_count, "phase 1: task {position}/{task_count}"
+    );
+
+    let p1_start = Instant::now();
+
+    let p1_output: PhaseOutput =
+        phase::run_phase1(agent_path, config, task.index, &task.content).map_err(|e| {
+            error!(
+                task_index = task.index,
+                position,
+                task_count,
+                err = %e,
+                "phase 1 failed"
+            );
+            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                error!(err = %save_err, "failed to save state after phase 1 failure");
+            }
+            e
+        })?;
+
+    let p1_duration = p1_start.elapsed();
+
+    info!(
+        task_index = task.index,
+        position,
+        task_count,
+        duration_ms = p1_duration.as_millis() as u64,
+        plan_text_len = p1_output.stdout.len(),
+        "phase 1 complete"
+    );
+
+    // -- Phase 2 --
+    info!(
+        task_index = task.index,
+        position, task_count, "phase 2: task {position}/{task_count}"
+    );
+
+    let p2_start = Instant::now();
+
+    let p2_output: PhaseOutput =
+        phase::run_phase2(agent_path, config, task.index, &p1_output.stdout).map_err(|e| {
+            error!(
+                task_index = task.index,
+                position,
+                task_count,
+                err = %e,
+                "phase 2 failed"
+            );
+            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                error!(err = %save_err, "failed to save state after phase 2 failure");
+            }
+            e
+        })?;
+
+    let p2_duration = p2_start.elapsed();
+
+    info!(
+        task_index = task.index,
+        position,
+        task_count,
+        duration_ms = p2_duration.as_millis() as u64,
+        stdout_len = p2_output.stdout.len(),
+        "phase 2 complete"
+    );
+
+    // -- Phase 3 (stet review + address) --
+    let phase3_outcome = if let Some(sp) = stet_path {
+        let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+
+        info!(
+            task_index = task.index,
+            position, task_count,
+            "phase 3: running stet review"
+        );
+
+        let stet_result = stet::run_review(sp, &config.repo_path, timeout)
+            .map_err(|e| {
+                error!(task_index = task.index, err = %e, "stet run failed");
+                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                    error!(err = %save_err, "failed to save state after stet failure");
+                }
+                e
+            })?;
+
+        if stet_result.has_findings {
+            info!(task_index = task.index, "phase 3: findings detected, starting address loop");
+
+            let outcome = stet::address_loop(agent_path, sp, config, task.index, &stet_result)
+                .map_err(|e| {
+                    error!(task_index = task.index, err = %e, "address loop failed");
+                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                        error!(err = %save_err, "failed to save state after address failure");
+                    }
+                    e
+                })?;
+
+            info!(
+                task_index = task.index,
+                rounds = outcome.rounds_used,
+                resolved = outcome.findings_resolved,
+                "phase 3 complete"
+            );
+            Some(outcome)
+        } else {
+            info!(task_index = task.index, "phase 3: no findings, skipping address loop");
+            Some(stet::AddressLoopOutcome {
+                rounds_used: 0,
+                findings_resolved: true,
+                last_stet_result: stet_result,
+            })
+        }
+    } else {
+        None
+    };
+
+    peal_state.mark_task_completed(task.index);
+    state::save_state(peal_state, state_dir)?;
+
+    Ok(TaskResult {
+        task_index: task.index,
+        plan_text: p1_output.stdout,
+        phase2_stdout: p2_output.stdout,
+        phase3_outcome,
+    })
+}
+
+/// Segment-aware execution scheduler.
 ///
-/// For each task in order:
-///   1. Phase 1 (plan creation) — capture the plan text.
-///   2. Phase 2 (execution)     — pass the plan text to the agent.
+/// Iterates over `plan.segments` instead of `plan.tasks` directly:
+/// - `Sequential(idx)` — runs the single task through P1 → P2 → P3.
+/// - `Parallel(indices)` — currently runs pending tasks sequentially as a
+///   fallback. SP-5.2 will replace the inner loop with concurrent execution.
 ///
-/// On success, marks the task completed in `peal_state` and persists to
-/// `state_dir`.  On failure, best-effort saves current state before
-/// returning the original error.
-pub fn run_all(
+/// State is persisted per-task (not per-segment) to enable fine-grained resume.
+pub fn run_scheduled(
     agent_path: &Path,
     config: &PealConfig,
     plan: &ParsedPlan,
@@ -130,156 +271,111 @@ pub fn run_all(
 ) -> Result<Vec<TaskResult>, PealError> {
     let task_count = plan.tasks.len();
     let phase3_available = stet_path.is_some();
-    info!(task_count, phase3_available, "starting sequential run (phase 1 → phase 2)");
+    info!(
+        task_count,
+        segment_count = plan.segments.len(),
+        phase3_available,
+        "starting scheduled run"
+    );
 
     let mut results: Vec<TaskResult> = Vec::with_capacity(task_count);
+    let mut position: usize = 0;
 
-    for (i, task) in plan.tasks.iter().enumerate() {
-        let position = i + 1;
+    for segment in &plan.segments {
+        match segment {
+            crate::plan::Segment::Sequential(idx) => {
+                let idx = *idx;
+                position += 1;
 
-        if peal_state.is_task_completed(task.index) {
-            info!(
-                task_index = task.index,
-                position, task_count, "skipping already-completed task {position}/{task_count}"
-            );
-            continue;
-        }
-
-        // -- Phase 1 --
-        info!(
-            task_index = task.index,
-            position, task_count, "phase 1: task {position}/{task_count}"
-        );
-
-        let p1_start = Instant::now();
-
-        let p1_output: PhaseOutput =
-            phase::run_phase1(agent_path, config, task.index, &task.content).map_err(|e| {
-                error!(
-                    task_index = task.index,
-                    position,
-                    task_count,
-                    err = %e,
-                    "phase 1 failed"
-                );
-                if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                    error!(err = %save_err, "failed to save state after phase 1 failure");
+                if peal_state.is_task_completed(idx) {
+                    info!(
+                        task_index = idx,
+                        position, task_count, "skipping already-completed task"
+                    );
+                    continue;
                 }
-                e
-            })?;
 
-        let p1_duration = p1_start.elapsed();
-
-        info!(
-            task_index = task.index,
-            position,
-            task_count,
-            duration_ms = p1_duration.as_millis() as u64,
-            plan_text_len = p1_output.stdout.len(),
-            "phase 1 complete"
-        );
-
-        // -- Phase 2 --
-        info!(
-            task_index = task.index,
-            position, task_count, "phase 2: task {position}/{task_count}"
-        );
-
-        let p2_start = Instant::now();
-
-        let p2_output: PhaseOutput =
-            phase::run_phase2(agent_path, config, task.index, &p1_output.stdout).map_err(|e| {
-                error!(
-                    task_index = task.index,
-                    position,
-                    task_count,
-                    err = %e,
-                    "phase 2 failed"
-                );
-                if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                    error!(err = %save_err, "failed to save state after phase 2 failure");
-                }
-                e
-            })?;
-
-        let p2_duration = p2_start.elapsed();
-
-        info!(
-            task_index = task.index,
-            position,
-            task_count,
-            duration_ms = p2_duration.as_millis() as u64,
-            stdout_len = p2_output.stdout.len(),
-            "phase 2 complete"
-        );
-
-        // -- Phase 3 (stet review + address) --
-        let phase3_outcome = if let Some(sp) = stet_path {
-            let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
-
-            info!(
-                task_index = task.index,
-                position, task_count,
-                "phase 3: running stet review"
-            );
-
-            let stet_result = stet::run_review(sp, &config.repo_path, timeout)
-                .map_err(|e| {
-                    error!(task_index = task.index, err = %e, "stet run failed");
-                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                        error!(err = %save_err, "failed to save state after stet failure");
+                let task = plan.task_by_index(idx).ok_or_else(|| {
+                    PealError::TaskNotFound {
+                        index: idx,
+                        available: plan.tasks.iter().map(|t| t.index).collect(),
                     }
-                    e
                 })?;
 
-            if stet_result.has_findings {
-                info!(task_index = task.index, "phase 3: findings detected, starting address loop");
+                let result = run_single_task(
+                    agent_path, config, task, peal_state, state_dir, stet_path,
+                    task_count, position,
+                )?;
+                results.push(result);
+            }
 
-                let outcome = stet::address_loop(agent_path, sp, config, task.index, &stet_result)
-                    .map_err(|e| {
-                        error!(task_index = task.index, err = %e, "address loop failed");
-                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                            error!(err = %save_err, "failed to save state after address failure");
-                        }
-                        e
-                    })?;
+            crate::plan::Segment::Parallel(indices) => {
+                let pending: Vec<u32> = indices
+                    .iter()
+                    .copied()
+                    .filter(|idx| !peal_state.is_task_completed(*idx))
+                    .collect();
+
+                if pending.is_empty() {
+                    position += indices.len();
+                    info!(
+                        block_indices = ?indices,
+                        "skipping fully-completed parallel block"
+                    );
+                    continue;
+                }
 
                 info!(
-                    task_index = task.index,
-                    rounds = outcome.rounds_used,
-                    resolved = outcome.findings_resolved,
-                    "phase 3 complete"
+                    block_size = indices.len(),
+                    pending_count = pending.len(),
+                    block_indices = ?indices,
+                    "parallel block (sequential fallback until SP-5.2)"
                 );
-                Some(outcome)
-            } else {
-                info!(task_index = task.index, "phase 3: no findings, skipping address loop");
-                Some(stet::AddressLoopOutcome {
-                    rounds_used: 0,
-                    findings_resolved: true,
-                    last_stet_result: stet_result,
-                })
+
+                for idx in &pending {
+                    position += 1;
+
+                    let task = plan.task_by_index(*idx).ok_or_else(|| {
+                        PealError::TaskNotFound {
+                            index: *idx,
+                            available: plan.tasks.iter().map(|t| t.index).collect(),
+                        }
+                    })?;
+
+                    let result = run_single_task(
+                        agent_path, config, task, peal_state, state_dir, stet_path,
+                        task_count, position,
+                    )?;
+                    results.push(result);
+                }
+
+                // Advance position past any already-completed tasks in the block.
+                let completed_in_block = indices.len() - pending.len();
+                position += completed_in_block;
             }
-        } else {
-            None
-        };
-
-        peal_state.mark_task_completed(task.index);
-        state::save_state(peal_state, state_dir)?;
-
-        results.push(TaskResult {
-            task_index: task.index,
-            plan_text: p1_output.stdout,
-            phase2_stdout: p2_output.stdout,
-            phase3_outcome,
-        });
+        }
     }
 
     info!(
         completed = results.len(),
-        task_count, "all tasks complete (phase 1 → phase 2)"
+        task_count, "all tasks complete"
     );
 
     Ok(results)
+}
+
+/// Run the full pipeline for every task. Delegates to `run_scheduled`.
+///
+/// Kept as a stable entry point so existing callers and tests continue to work.
+pub fn run_all(
+    agent_path: &Path,
+    config: &PealConfig,
+    plan: &ParsedPlan,
+    peal_state: &mut PealState,
+    state_dir: &Path,
+    stet_path: Option<&Path>,
+) -> Result<Vec<TaskResult>, PealError> {
+    run_scheduled(agent_path, config, plan, peal_state, state_dir, stet_path)
 }
 
 #[cfg(test)]
@@ -315,7 +411,7 @@ mod tests {
     }
 
     fn make_plan(tasks: Vec<Task>) -> ParsedPlan {
-        let segments = tasks.iter().map(|t| Segment::Sequential(t.index)).collect();
+        let segments = crate::plan::compute_segments(&tasks);
         ParsedPlan { tasks, segments }
     }
 
@@ -1112,6 +1208,196 @@ mod tests {
         assert!(
             loaded.completed_task_indices.is_empty(),
             "no tasks should be completed since stet failed before marking"
+        );
+    }
+
+    // -- run_scheduled / segment-aware scheduler tests (SP-5.1) --
+
+    #[test]
+    fn scheduled_all_sequential_runs_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: false },
+            Task { index: 3, content: "C.".to_owned(), parallel: false },
+        ]);
+
+        assert_eq!(
+            plan.segments,
+            vec![Segment::Sequential(1), Segment::Sequential(2), Segment::Sequential(3)]
+        );
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn scheduled_mixed_plan_runs_all_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+            Task { index: 4, content: "D.".to_owned(), parallel: false },
+        ]);
+
+        assert_eq!(
+            plan.segments,
+            vec![
+                Segment::Sequential(1),
+                Segment::Parallel(vec![2, 3]),
+                Segment::Sequential(4),
+            ]
+        );
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![1, 2, 3, 4]);
+
+        assert!(state.is_task_completed(1));
+        assert!(state.is_task_completed(2));
+        assert!(state.is_task_completed(3));
+        assert!(state.is_task_completed(4));
+    }
+
+    #[test]
+    fn scheduled_resume_within_parallel_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+
+        let mut state = fresh_state();
+        state.mark_task_completed(1);
+        state.mark_task_completed(2);
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+            Task { index: 4, content: "D.".to_owned(), parallel: false },
+        ]);
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![3, 4], "task 2 already done; only 3 and 4 should run");
+    }
+
+    #[test]
+    fn scheduled_single_parallel_task_demoted_to_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: false },
+        ]);
+
+        // compute_segments demotes single-parallel to Sequential.
+        assert_eq!(
+            plan.segments,
+            vec![Segment::Sequential(1), Segment::Sequential(2), Segment::Sequential(3)]
+        );
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn scheduled_all_completed_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+
+        let mut state = fresh_state();
+        state.mark_task_completed(1);
+        state.mark_task_completed(2);
+        state.mark_task_completed(3);
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        assert!(results.is_empty(), "no tasks should run when all are completed");
+    }
+
+    #[test]
+    fn scheduled_fail_fast_in_parallel_block_saves_prior() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".peal");
+        let echo = resolve_echo();
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+
+        // Task 1 runs with echo (succeeds), then task 2 in the parallel block
+        // would need to fail. Since we can't mix agents per-task, we instead
+        // test that a fully-failing agent applied to a parallel block still
+        // persists the state properly.
+        let config = PealConfig {
+            agent_cmd: "false".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
+            state_dir: state_dir.clone(),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
+        };
+
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "Will fail.".to_owned(), parallel: true },
+            Task { index: 2, content: "Never reached.".to_owned(), parallel: true },
+            Task { index: 3, content: "Never reached.".to_owned(), parallel: false },
+        ]);
+
+        assert_eq!(
+            plan.segments,
+            vec![Segment::Parallel(vec![1, 2]), Segment::Sequential(3)]
+        );
+
+        let err = run_scheduled(&false_path, &config, &plan, &mut state, &state_dir, None)
+            .unwrap_err();
+
+        match err {
+            PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 1),
+            other => panic!("expected PhaseNonZeroExit, got: {other:?}"),
+        }
+
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist even on failure");
+        assert!(
+            loaded.completed_task_indices.is_empty(),
+            "no tasks should be completed since first task in block failed"
         );
     }
 }

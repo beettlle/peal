@@ -120,6 +120,11 @@ pub fn parse_plan(content: &str) -> anyhow::Result<ParsedPlan> {
 }
 
 impl ParsedPlan {
+    /// Look up a task by its index. O(n) scan, fine for typical plan sizes (<50 tasks).
+    pub fn task_by_index(&self, index: u32) -> Option<&Task> {
+        self.tasks.iter().find(|t| t.index == index)
+    }
+
     /// Return a new plan containing only the task with the given index.
     ///
     /// Segments are recomputed from the filtered task list.
@@ -159,7 +164,7 @@ impl ParsedPlan {
 ///
 /// Consecutive tasks with `parallel == true` form one `Segment::Parallel` block
 /// (unless only one task, which is treated as `Segment::Sequential`).
-fn compute_segments(tasks: &[Task]) -> Vec<Segment> {
+pub(crate) fn compute_segments(tasks: &[Task]) -> Vec<Segment> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut i = 0;
 
@@ -642,5 +647,34 @@ D
                 t.index
             );
         }
+    }
+
+    // -- task_by_index tests --
+
+    #[test]
+    fn task_by_index_finds_existing() {
+        let plan = make_plan_123();
+        let t = plan.task_by_index(2).expect("task 2 should exist");
+        assert_eq!(t.index, 2);
+        assert_eq!(t.content, "B");
+    }
+
+    #[test]
+    fn task_by_index_returns_none_for_missing() {
+        let plan = make_plan_123();
+        assert!(plan.task_by_index(99).is_none());
+    }
+
+    #[test]
+    fn task_by_index_boundary_first_and_last() {
+        let plan = make_plan_123();
+        assert_eq!(plan.task_by_index(1).unwrap().index, 1);
+        assert_eq!(plan.task_by_index(3).unwrap().index, 3);
+    }
+
+    #[test]
+    fn task_by_index_zero_returns_none() {
+        let plan = make_plan_123();
+        assert!(plan.task_by_index(0).is_none());
     }
 }

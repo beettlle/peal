@@ -136,7 +136,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
-            let run_result = runner::run_all(
+            let run_result = runner::run_scheduled(
                 &agent_path,
                 &config,
                 &parsed,
