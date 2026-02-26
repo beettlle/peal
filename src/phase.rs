@@ -273,6 +273,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         }
     }
 
@@ -481,6 +483,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -534,6 +538,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -566,6 +572,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let sleep_path = crate::cursor::resolve_agent_cmd("sleep").expect("sleep must exist");
@@ -606,6 +614,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -642,6 +652,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -690,6 +702,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -721,6 +735,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -821,6 +837,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -871,6 +889,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -902,6 +922,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -936,6 +958,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -986,6 +1010,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");

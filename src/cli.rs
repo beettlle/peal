@@ -112,6 +112,15 @@ pub struct RunArgs {
     /// is invoked without a ref argument.
     #[arg(long)]
     pub stet_start_ref: Option<String>,
+
+    /// Extra arguments for `stet start` (e.g. `--allow-dirty`). Space-separated.
+    #[arg(long)]
+    pub stet_start_args: Option<String>,
+
+    /// Extra arguments for `stet run` (e.g. `--verify --context 256k`). Space-separated.
+    /// Peal always passes `--output=json` for run.
+    #[arg(long)]
+    pub stet_run_args: Option<String>,
 }
 
 #[cfg(test)]
@@ -175,6 +184,8 @@ mod tests {
             "5",
             "--stet-start-ref",
             "HEAD~1",
+            "--stet-start-args=--allow-dirty",
+            "--stet-run-args=--verify --context 256k",
         ])
         .expect("should parse all flags");
 
@@ -190,6 +201,11 @@ mod tests {
                 assert_eq!(args.max_parallel, Some(8));
                 assert_eq!(args.max_address_rounds, Some(5));
                 assert_eq!(args.stet_start_ref.as_deref(), Some("HEAD~1"));
+                assert_eq!(args.stet_start_args.as_deref(), Some("--allow-dirty"));
+                assert_eq!(
+                    args.stet_run_args.as_deref(),
+                    Some("--verify --context 256k")
+                );
             }
             Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }

@@ -1,8 +1,8 @@
 //! Stet CLI resolution and session management.
 //!
-//! Locates the `stet` binary for Phase 3 (review & address findings).
-//! Unlike `cursor::resolve_agent_cmd`, a missing `stet` is not an error —
-//! it simply means Phase 3 will be skipped.
+//! Phase 3 uses stet for review and address. Peal invokes `stet run` with `--output=json`
+//! so findings are machine-readable; it requires a stet binary that supports `--output=json`.
+//! If stet is not found on PATH (or via `stet_path`), Phase 3 is skipped.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,15 +63,17 @@ pub struct StetOutput {
     pub stderr: String,
 }
 
-/// Start a stet review session by invoking `stet start [ref]`.
+/// Start a stet review session by invoking `stet start [ref] [extra_args...]`.
 ///
 /// - `stet_path`: absolute path to the stet binary.
 /// - `start_ref`: optional git ref (e.g. `"HEAD~1"`); omitted means bare `stet start`.
+/// - `extra_args`: optional pass-through args (e.g. `["--allow-dirty"]`).
 /// - `repo_path`: working directory for the subprocess.
 /// - `timeout`: optional per-command timeout.
 pub fn start_session(
     stet_path: &Path,
     start_ref: Option<&str>,
+    extra_args: &[String],
     repo_path: &Path,
     timeout: Option<Duration>,
 ) -> Result<StetOutput, PealError> {
@@ -80,6 +82,7 @@ pub fn start_session(
     if let Some(r) = start_ref {
         args.push(r.to_owned());
     }
+    args.extend(extra_args.iter().cloned());
 
     info!(
         stet = %stet_str,
@@ -196,7 +199,10 @@ pub struct StetRunResult {
     pub has_findings: bool,
 }
 
-/// Run an incremental stet review by invoking `stet run` in `repo_path`.
+/// Run an incremental stet review by invoking `stet run --output=json [extra_args...]` in `repo_path`.
+///
+/// Peal always passes `--output=json` so stdout is machine-readable; `extra_args` are appended
+/// (e.g. `--verify`, `--context 256k`). Requires stet that supports `--output=json`.
 ///
 /// Unlike `start_session`, a non-zero exit code is **not** treated as an error —
 /// it is the standard linter convention for "findings present." Only spawn failures
@@ -204,10 +210,12 @@ pub struct StetRunResult {
 pub fn run_review(
     stet_path: &Path,
     repo_path: &Path,
+    extra_args: &[String],
     timeout: Option<Duration>,
 ) -> Result<StetRunResult, PealError> {
     let stet_str = stet_path.to_string_lossy();
-    let args: Vec<String> = vec!["run".to_owned()];
+    let mut args: Vec<String> = vec!["run".to_owned(), "--output=json".to_owned()];
+    args.extend(extra_args.iter().cloned());
 
     info!(
         stet = %stet_str,
@@ -251,8 +259,11 @@ pub fn run_review(
 /// 1. **JSON (machine-readable):** If stdout parses as a JSON object with a
 ///    `"findings"` key containing a non-empty array, or a `"count"` key > 0 →
 ///    findings present. A top-level JSON array with items also means findings.
-/// 2. **Exit code heuristic:** If JSON parsing fails, non-zero exit → findings present.
-/// 3. **Stdout content heuristic:** If exit code is 0 but stdout contains
+/// 2. **Human summary (stet default):** If stdout is not JSON and the last line
+///    indicates zero findings (e.g. "0 finding(s)." or "0 finding(s) at X tokens/sec.") →
+///    no findings.
+/// 3. **Exit code heuristic:** If JSON parsing fails, non-zero exit → findings present.
+/// 4. **Stdout content heuristic:** If exit code is 0 but stdout contains
 ///    non-whitespace content → findings present.
 pub fn detect_findings(exit_code: Option<i32>, stdout: &str) -> bool {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) {
@@ -275,13 +286,26 @@ pub fn detect_findings(exit_code: Option<i32>, stdout: &str) -> bool {
         };
     }
 
+    // Human-output fallback: stet's writeFindingsHuman prints "0 finding(s)." or "0 finding(s) at X tokens/sec."
+    // when there are no findings. Treat those as no findings so we don't falsely loop.
+    let trimmed = stdout.trim();
+    if exit_code == Some(0) && !trimmed.is_empty() {
+        let last_line = trimmed.lines().last().unwrap_or(trimmed).trim();
+        if last_line == "0 finding(s)."
+            || last_line == "0 finding(s)"
+            || last_line.starts_with("0 finding(s) at ")
+        {
+            return false;
+        }
+    }
+
     // Non-JSON fallback: non-zero exit code signals findings.
     if exit_code != Some(0) {
         return true;
     }
 
     // Exit code 0 but non-whitespace stdout → findings present.
-    !stdout.trim().is_empty()
+    !trimmed.is_empty()
 }
 
 /// Extract `suggestion` fields from stet JSON output.
@@ -373,7 +397,12 @@ pub fn address_loop(
 
         address_findings(agent_path, config, task_index, &current_result)?;
 
-        let new_result = run_review(stet_path, &config.repo_path, timeout)?;
+        let new_result = run_review(
+            stet_path,
+            &config.repo_path,
+            &config.stet_run_extra_args,
+            timeout,
+        )?;
 
         if !new_result.has_findings {
             info!(task_index, round, "address loop: findings resolved");
@@ -591,7 +620,7 @@ mod tests {
             crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
         };
 
-        let out = start_session(&echo, None, dir.path(), Some(Duration::from_secs(10))).unwrap();
+        let out = start_session(&echo, None, &[], dir.path(), Some(Duration::from_secs(10))).unwrap();
 
         assert!(
             out.stdout.contains("start"),
@@ -618,6 +647,7 @@ mod tests {
         let out = start_session(
             &echo,
             Some("HEAD~1"),
+            &[],
             dir.path(),
             Some(Duration::from_secs(10)),
         )
@@ -641,7 +671,7 @@ mod tests {
         let false_path =
             crate::cursor::resolve_agent_cmd("false").expect("false must exist");
 
-        let err = start_session(&false_path, None, dir.path(), Some(Duration::from_secs(10)))
+        let err = start_session(&false_path, None, &[], dir.path(), Some(Duration::from_secs(10)))
             .unwrap_err();
 
         match err {
@@ -660,7 +690,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bad_path = PathBuf::from("/no/such/stet-binary");
 
-        let err = start_session(&bad_path, None, dir.path(), Some(Duration::from_secs(10)))
+        let err = start_session(&bad_path, None, &[], dir.path(), Some(Duration::from_secs(10)))
             .unwrap_err();
 
         match err {
@@ -680,7 +710,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pwd_script = pwd_script_ignoring_args(&dir);
 
-        let out = start_session(&pwd_script, None, dir.path(), Some(Duration::from_secs(10)))
+        let out = start_session(&pwd_script, None, &[], dir.path(), Some(Duration::from_secs(10)))
             .unwrap();
 
         let expected = dir.path().canonicalize().unwrap();
@@ -778,6 +808,32 @@ mod tests {
         assert!(!detect_findings(Some(0), "true"));
     }
 
+    #[test]
+    fn detect_findings_human_zero_findings_with_newline() {
+        assert!(!detect_findings(Some(0), "0 finding(s).\n"));
+    }
+
+    #[test]
+    fn detect_findings_human_zero_findings_no_trailing_dot() {
+        assert!(!detect_findings(Some(0), "0 finding(s)"));
+    }
+
+    #[test]
+    fn detect_findings_human_zero_findings_with_tokens_per_sec() {
+        assert!(!detect_findings(Some(0), "0 finding(s) at 12.3 tokens/sec.\n"));
+    }
+
+    #[test]
+    fn detect_findings_human_one_finding() {
+        assert!(detect_findings(Some(0), "1 finding.\n"));
+    }
+
+    #[test]
+    fn detect_findings_human_multiline_last_line_zero_findings() {
+        let stdout = "some header\n0 finding(s).";
+        assert!(!detect_findings(Some(0), stdout));
+    }
+
     // -- run_review integration tests --
 
     #[test]
@@ -790,7 +846,7 @@ mod tests {
             crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
         };
 
-        let result = run_review(&echo, dir.path(), Some(Duration::from_secs(10))).unwrap();
+        let result = run_review(&echo, dir.path(), &[], Some(Duration::from_secs(10))).unwrap();
 
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.contains("run"), "stdout should echo 'run'");
@@ -802,7 +858,7 @@ mod tests {
         let false_path =
             crate::cursor::resolve_agent_cmd("false").expect("false must exist");
 
-        let result = run_review(&false_path, dir.path(), Some(Duration::from_secs(10))).unwrap();
+        let result = run_review(&false_path, dir.path(), &[], Some(Duration::from_secs(10))).unwrap();
 
         assert_ne!(result.exit_code, Some(0));
         assert!(result.has_findings);
@@ -813,7 +869,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bad_path = PathBuf::from("/no/such/stet-binary");
 
-        let err = run_review(&bad_path, dir.path(), Some(Duration::from_secs(10))).unwrap_err();
+        let err = run_review(&bad_path, dir.path(), &[], Some(Duration::from_secs(10))).unwrap_err();
 
         match err {
             PealError::StetRunFailed { detail } => {
@@ -836,7 +892,7 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let err = run_review(&script, dir.path(), Some(Duration::from_millis(200)))
+        let err = run_review(&script, dir.path(), &[], Some(Duration::from_millis(200)))
             .unwrap_err();
 
         match err {
@@ -856,7 +912,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pwd_script = pwd_script_ignoring_args(&dir);
 
-        let result = run_review(&pwd_script, dir.path(), Some(Duration::from_secs(10))).unwrap();
+        let result = run_review(&pwd_script, dir.path(), &[], Some(Duration::from_secs(10))).unwrap();
 
         let expected = dir.path().canonicalize().unwrap();
         let actual: PathBuf = result.stdout.trim().into();
@@ -950,6 +1006,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let stet_result = StetRunResult {
@@ -1005,6 +1063,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let stet_result = StetRunResult {
@@ -1082,6 +1142,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let initial = StetRunResult {
@@ -1127,6 +1189,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let initial = StetRunResult {
@@ -1170,6 +1234,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let initial = StetRunResult {
@@ -1294,6 +1360,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let initial = StetRunResult {

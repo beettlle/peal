@@ -61,6 +61,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let stet_out = stet::start_session(
                     sp,
                     config.stet_start_ref.as_deref(),
+                    &config.stet_start_extra_args,
                     &config.repo_path,
                     Some(Duration::from_secs(config.phase_timeout_sec)),
                 )?;

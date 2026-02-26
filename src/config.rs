@@ -39,6 +39,11 @@ pub struct PealConfig {
     pub log_file: Option<PathBuf>,
     pub stet_path: Option<PathBuf>,
     pub stet_start_ref: Option<String>,
+    /// Extra arguments passed through to `stet start` (e.g. `--allow-dirty`).
+    pub stet_start_extra_args: Vec<String>,
+    /// Extra arguments passed through to `stet run` (e.g. `--verify`, `--context 256k`).
+    /// Peal always adds `--output=json` for run; these are appended so user flags are supported.
+    pub stet_run_extra_args: Vec<String>,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -61,6 +66,8 @@ struct FileConfig {
     log_file: Option<PathBuf>,
     stet_path: Option<PathBuf>,
     stet_start_ref: Option<String>,
+    stet_start_extra_args: Option<Vec<String>>,
+    stet_run_extra_args: Option<Vec<String>>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -82,6 +89,8 @@ struct ConfigLayer {
     log_file: Option<PathBuf>,
     stet_path: Option<PathBuf>,
     stet_start_ref: Option<String>,
+    stet_start_extra_args: Option<Vec<String>>,
+    stet_run_extra_args: Option<Vec<String>>,
 }
 
 impl PealConfig {
@@ -173,9 +182,13 @@ impl PealConfig {
             max_parallel: merged.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL),
             log_level: merged.log_level,
             log_file: merged.log_file,
-            stet_path: merged.stet_path,
-            stet_start_ref: merged.stet_start_ref,
-        })
+        stet_path: merged.stet_path,
+        stet_start_ref: merged.stet_start_ref,
+        stet_start_extra_args: merged
+            .stet_start_extra_args
+            .unwrap_or_default(),
+        stet_run_extra_args: merged.stet_run_extra_args.unwrap_or_default(),
+    })
     }
 }
 
@@ -201,6 +214,8 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         log_file: fc.log_file,
         stet_path: fc.stet_path,
         stet_start_ref: fc.stet_start_ref,
+        stet_start_extra_args: fc.stet_start_extra_args,
+        stet_run_extra_args: fc.stet_run_extra_args,
     })
 }
 
@@ -230,7 +245,21 @@ fn load_env_layer(
         log_file: env_fn("LOG_FILE").map(PathBuf::from),
         stet_path: env_fn("STET_PATH").map(PathBuf::from),
         stet_start_ref: env_fn("STET_START_REF"),
+        stet_start_extra_args: env_fn("STET_START_EXTRA_ARGS")
+            .as_deref()
+            .map(parse_extra_args_str),
+        stet_run_extra_args: env_fn("STET_RUN_EXTRA_ARGS")
+            .as_deref()
+            .map(parse_extra_args_str),
     })
+}
+
+/// Parse a string of extra args: split on comma and/or whitespace, trim, drop empty.
+fn parse_extra_args_str(s: &str) -> Vec<String> {
+    s.split(',')
+        .flat_map(|part| part.split_whitespace().map(|t| t.to_owned()))
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 fn parse_env_u32(
@@ -302,6 +331,11 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         log_file: args.log_file.clone(),
         stet_path: args.stet_path.clone(),
         stet_start_ref: args.stet_start_ref.clone(),
+        stet_start_extra_args: args
+            .stet_start_args
+            .as_deref()
+            .map(parse_extra_args_str),
+        stet_run_extra_args: args.stet_run_args.as_deref().map(parse_extra_args_str),
     }
 }
 
@@ -339,6 +373,14 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .stet_start_ref
             .or(env.stet_start_ref)
             .or(file.stet_start_ref),
+        stet_start_extra_args: cli
+            .stet_start_extra_args
+            .or(env.stet_start_extra_args)
+            .or(file.stet_start_extra_args),
+        stet_run_extra_args: cli
+            .stet_run_extra_args
+            .or(env.stet_run_extra_args)
+            .or(file.stet_run_extra_args),
     }
 }
 
@@ -370,6 +412,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_args: None,
+            stet_run_args: None,
         }
     }
 
@@ -483,6 +527,8 @@ model = "from-file"
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_args: None,
+            stet_run_args: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
 
@@ -548,6 +594,8 @@ agent_cmd = "from-file"
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_args: None,
+            stet_run_args: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
 
@@ -638,6 +686,8 @@ bogus_key = true
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_args: None,
+            stet_run_args: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
 
@@ -798,6 +848,8 @@ sandbox = "file-sandbox"
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_args: None,
+            stet_run_args: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
 
@@ -910,5 +962,63 @@ on_findings_remaining = "warn"
             msg.contains("Invalid on_findings_remaining"),
             "expected InvalidOnFindingsRemaining, got: {msg}"
         );
+    }
+
+    #[test]
+    fn stet_extra_args_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+stet_start_extra_args = ["--allow-dirty"]
+stet_run_extra_args = ["--verify", "--context", "256k"]
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+
+        assert_eq!(cfg.stet_start_extra_args, vec!["--allow-dirty"]);
+        assert_eq!(
+            cfg.stet_run_extra_args,
+            vec!["--verify", "--context", "256k"]
+        );
+    }
+
+    #[test]
+    fn stet_extra_args_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            match suffix {
+                "STET_START_EXTRA_ARGS" => Some("--allow-dirty".to_owned()),
+                "STET_RUN_EXTRA_ARGS" => Some("--verify --context 256k".to_owned()),
+                _ => None,
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+
+        assert_eq!(cfg.stet_start_extra_args, vec!["--allow-dirty"]);
+        assert_eq!(
+            cfg.stet_run_extra_args,
+            vec!["--verify", "--context", "256k"]
+        );
+    }
+
+    #[test]
+    fn parse_extra_args_str_splits_space_and_comma() {
+        assert_eq!(
+            parse_extra_args_str("--a --b"),
+            vec!["--a", "--b"]
+        );
+        assert_eq!(
+            parse_extra_args_str("--a,--b,256k"),
+            vec!["--a", "--b", "256k"]
+        );
+        assert_eq!(parse_extra_args_str(""), vec![] as Vec<String>);
     }
 }

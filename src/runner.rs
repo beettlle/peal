@@ -202,7 +202,12 @@ fn run_single_task(
             "phase 3: running stet review"
         );
 
-        let stet_result = stet::run_review(sp, &config.repo_path, timeout)
+        let stet_result = stet::run_review(
+            sp,
+            &config.repo_path,
+            &config.stet_run_extra_args,
+            timeout,
+        )
             .map_err(|e| {
                 error!(task_index = task.index, err = %e, "stet run failed");
                 if let Err(save_err) = state::save_state(peal_state, state_dir) {
@@ -403,6 +408,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         }
     }
 
@@ -496,6 +503,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -658,6 +667,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -832,6 +843,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let mut state = fresh_state();
@@ -1369,6 +1382,8 @@ mod tests {
             log_file: None,
             stet_path: None,
             stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
         };
 
         let mut state = fresh_state();
