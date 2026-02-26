@@ -258,12 +258,130 @@ fn run_single_task(
     })
 }
 
+/// Run Phase 1 → Phase 2 for a single task with no state mutation and no Phase 3.
+/// Each scoped thread executes this; the main thread handles state and Phase 3 after join.
+fn run_phases_1_2(
+    agent_path: &Path,
+    config: &PealConfig,
+    task: &crate::plan::Task,
+    task_count: usize,
+    position: usize,
+) -> Result<(String, String), PealError> {
+    info!(
+        task_index = task.index,
+        position, task_count, "phase 1: task {position}/{task_count}"
+    );
+
+    let p1_start = Instant::now();
+    let p1_output =
+        phase::run_phase1(agent_path, config, task.index, &task.content).map_err(|e| {
+            error!(
+                task_index = task.index,
+                position, task_count, err = %e, "phase 1 failed"
+            );
+            e
+        })?;
+    let p1_duration = p1_start.elapsed();
+
+    info!(
+        task_index = task.index,
+        position, task_count,
+        duration_ms = p1_duration.as_millis() as u64,
+        plan_text_len = p1_output.stdout.len(),
+        "phase 1 complete"
+    );
+
+    info!(
+        task_index = task.index,
+        position, task_count, "phase 2: task {position}/{task_count}"
+    );
+
+    let p2_start = Instant::now();
+    let p2_output =
+        phase::run_phase2(agent_path, config, task.index, &p1_output.stdout).map_err(|e| {
+            error!(
+                task_index = task.index,
+                position, task_count, err = %e, "phase 2 failed"
+            );
+            e
+        })?;
+    let p2_duration = p2_start.elapsed();
+
+    info!(
+        task_index = task.index,
+        position, task_count,
+        duration_ms = p2_duration.as_millis() as u64,
+        stdout_len = p2_output.stdout.len(),
+        "phase 2 complete"
+    );
+
+    Ok((p1_output.stdout, p2_output.stdout))
+}
+
+/// Run Phase 1 → Phase 2 concurrently for a batch of pending tasks.
+///
+/// Tasks are chunked into groups of `max_concurrent`; within each chunk,
+/// scoped threads run one task each. After all threads in a chunk join,
+/// results are partitioned into successes and failures. Processing stops
+/// after the first chunk that contains any failure.
+fn run_parallel_block(
+    agent_path: &Path,
+    config: &PealConfig,
+    plan: &ParsedPlan,
+    pending: &[u32],
+    task_count: usize,
+    base_position: usize,
+    max_concurrent: usize,
+) -> (Vec<(u32, String, String)>, Vec<(u32, PealError)>) {
+    let mut successes: Vec<(u32, String, String)> = Vec::new();
+    let mut failures: Vec<(u32, PealError)> = Vec::new();
+    let mut offset = 0;
+
+    for chunk in pending.chunks(max_concurrent) {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, &idx)| {
+                    let position = base_position + offset + i + 1;
+                    let task = plan
+                        .task_by_index(idx)
+                        .expect("task index validated before parallel block");
+                    s.spawn(move || {
+                        run_phases_1_2(agent_path, config, task, task_count, position)
+                            .map(|(plan_text, p2_stdout)| (idx, plan_text, p2_stdout))
+                            .map_err(|e| (idx, e))
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                match handle.join().expect("scoped thread must not panic") {
+                    Ok(success) => successes.push(success),
+                    Err(failure) => failures.push(failure),
+                }
+            }
+        });
+
+        offset += chunk.len();
+
+        if !failures.is_empty() {
+            break;
+        }
+    }
+
+    (successes, failures)
+}
+
 /// Segment-aware execution scheduler.
 ///
 /// Iterates over `plan.segments` instead of `plan.tasks` directly:
 /// - `Sequential(idx)` — runs the single task through P1 → P2 → P3.
-/// - `Parallel(indices)` — currently runs pending tasks sequentially as a
-///   fallback. SP-5.2 will replace the inner loop with concurrent execution.
+/// - `Parallel(indices)` — when `config.parallel` is true and more than one
+///   task is pending, runs P1 → P2 concurrently via `std::thread::scope`,
+///   persists successful tasks, then runs P3 sequentially.  Falls back to
+///   sequential execution when `config.parallel` is false or only one task
+///   remains.
 ///
 /// State is persisted per-task (not per-segment) to enable fine-grained resume.
 pub fn run_scheduled(
@@ -330,33 +448,132 @@ pub fn run_scheduled(
                     continue;
                 }
 
-                info!(
-                    block_size = indices.len(),
-                    pending_count = pending.len(),
-                    block_indices = ?indices,
-                    "parallel block (sequential fallback until SP-5.2)"
-                );
+                if config.parallel && pending.len() > 1 {
+                    // -- Concurrent path (SP-5.2) --
+                    let max_concurrent = (config.max_parallel as usize).max(1);
 
-                for idx in &pending {
-                    position += 1;
+                    info!(
+                        block_size = indices.len(),
+                        pending_count = pending.len(),
+                        max_concurrent,
+                        block_indices = ?indices,
+                        "parallel block: running concurrently"
+                    );
 
-                    let task = plan.task_by_index(*idx).ok_or_else(|| {
-                        PealError::TaskNotFound {
-                            index: *idx,
-                            available: plan.tasks.iter().map(|t| t.index).collect(),
-                        }
-                    })?;
+                    let (successes, failures) = run_parallel_block(
+                        agent_path, config, plan, &pending,
+                        task_count, position, max_concurrent,
+                    );
 
-                    let result = run_single_task(
-                        agent_path, config, task, peal_state, state_dir, stet_path,
-                        task_count, position,
-                    )?;
-                    results.push(result);
+                    // Persist all successful P1+P2 completions before Phase 3.
+                    for &(idx, _, _) in &successes {
+                        peal_state.mark_task_completed(idx);
+                    }
+                    if !successes.is_empty() {
+                        state::save_state(peal_state, state_dir)?;
+                    }
+
+                    // Phase 3 sequentially for each successful task (no concurrent stet).
+                    for (idx, plan_text, phase2_stdout) in successes {
+                        position += 1;
+
+                        let phase3_outcome = if let Some(sp) = stet_path {
+                            let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+
+                            info!(
+                                task_index = idx,
+                                position, task_count,
+                                "phase 3: running stet review"
+                            );
+
+                            let stet_result = stet::run_review(
+                                sp,
+                                &config.repo_path,
+                                &config.stet_run_extra_args,
+                                timeout,
+                            )
+                                .map_err(|e| {
+                                    error!(task_index = idx, err = %e, "stet run failed");
+                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                        error!(err = %save_err, "failed to save state after stet failure");
+                                    }
+                                    e
+                                })?;
+
+                            if stet_result.has_findings {
+                                info!(task_index = idx, "phase 3: findings detected, starting address loop");
+
+                                let outcome = stet::address_loop(agent_path, sp, config, idx, &stet_result)
+                                    .map_err(|e| {
+                                        error!(task_index = idx, err = %e, "address loop failed");
+                                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                            error!(err = %save_err, "failed to save state after address failure");
+                                        }
+                                        e
+                                    })?;
+
+                                info!(
+                                    task_index = idx,
+                                    rounds = outcome.rounds_used,
+                                    resolved = outcome.findings_resolved,
+                                    "phase 3 complete"
+                                );
+                                Some(outcome)
+                            } else {
+                                info!(task_index = idx, "phase 3: no findings, skipping address loop");
+                                Some(stet::AddressLoopOutcome {
+                                    rounds_used: 0,
+                                    findings_resolved: true,
+                                    last_stet_result: stet_result,
+                                })
+                            }
+                        } else {
+                            None
+                        };
+
+                        results.push(TaskResult {
+                            task_index: idx,
+                            plan_text,
+                            phase2_stdout,
+                            phase3_outcome,
+                        });
+                    }
+
+                    let completed_in_block = indices.len() - pending.len();
+                    position += completed_in_block + failures.len();
+
+                    if let Some((_idx, err)) = failures.into_iter().next() {
+                        return Err(err);
+                    }
+                } else {
+                    // -- Sequential fallback --
+                    info!(
+                        block_size = indices.len(),
+                        pending_count = pending.len(),
+                        block_indices = ?indices,
+                        "parallel block (sequential fallback)"
+                    );
+
+                    for idx in &pending {
+                        position += 1;
+
+                        let task = plan.task_by_index(*idx).ok_or_else(|| {
+                            PealError::TaskNotFound {
+                                index: *idx,
+                                available: plan.tasks.iter().map(|t| t.index).collect(),
+                            }
+                        })?;
+
+                        let result = run_single_task(
+                            agent_path, config, task, peal_state, state_dir, stet_path,
+                            task_count, position,
+                        )?;
+                        results.push(result);
+                    }
+
+                    let completed_in_block = indices.len() - pending.len();
+                    position += completed_in_block;
                 }
-
-                // Advance position past any already-completed tasks in the block.
-                let completed_in_block = indices.len() - pending.len();
-                position += completed_in_block;
             }
         }
     }
@@ -1424,5 +1641,176 @@ mod tests {
             loaded.completed_task_indices.is_empty(),
             "no tasks should be completed since first task in block failed"
         );
+    }
+
+    // -- SP-5.2 concurrent parallel execution tests --
+
+    fn test_config_parallel(repo: &Path) -> PealConfig {
+        PealConfig {
+            parallel: true,
+            ..test_config(repo)
+        }
+    }
+
+    #[test]
+    fn parallel_block_runs_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_parallel(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: true },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+
+        assert_eq!(results.len(), 3);
+        let mut indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        indices.sort();
+        assert_eq!(indices, vec![1, 2, 3]);
+
+        for r in &results {
+            assert!(!r.plan_text.is_empty(), "plan_text should be non-empty for task {}", r.task_index);
+            assert!(!r.phase2_stdout.is_empty(), "phase2_stdout should be non-empty for task {}", r.task_index);
+            assert!(r.phase3_outcome.is_none(), "phase3_outcome should be None when stet_path is None");
+        }
+    }
+
+    #[test]
+    fn parallel_block_sequential_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path()); // parallel: false
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: true },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![1, 2, 3], "sequential fallback preserves order");
+    }
+
+    #[test]
+    fn parallel_block_single_task_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_parallel(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: false },
+        ]);
+
+        // Single parallel task demoted to Sequential by compute_segments.
+        assert_eq!(
+            plan.segments,
+            vec![Segment::Sequential(1), Segment::Sequential(2), Segment::Sequential(3)]
+        );
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parallel_block_respects_max_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config_parallel(dir.path());
+        config.max_parallel = 1;
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: true },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+
+        assert_eq!(results.len(), 3);
+        let mut indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
+        indices.sort();
+        assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parallel_block_persists_state_for_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_parallel(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: true },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist after run");
+        assert_eq!(loaded.completed_task_indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parallel_block_failure_persists_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".peal");
+        let echo = resolve_echo();
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+
+        // Step 1: run task 1 (sequential) successfully.
+        let config = test_config_parallel(dir.path());
+        let mut state = fresh_state();
+
+        let plan_step1 = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+        ]);
+        run_scheduled(&echo, &config, &plan_step1, &mut state, &state_dir, None).unwrap();
+        assert!(state.is_task_completed(1));
+
+        // Step 2: run with `false` agent; tasks 2,3 form a parallel block and fail.
+        let plan_step2 = make_plan(vec![
+            Task { index: 1, content: "A.".to_owned(), parallel: false },
+            Task { index: 2, content: "B.".to_owned(), parallel: true },
+            Task { index: 3, content: "C.".to_owned(), parallel: true },
+        ]);
+
+        let err = run_scheduled(&false_path, &config, &plan_step2, &mut state, &state_dir, None)
+            .unwrap_err();
+
+        match err {
+            PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 1),
+            other => panic!("expected PhaseNonZeroExit, got: {other:?}"),
+        }
+
+        // Task 1 persisted from step 1; tasks 2,3 not completed.
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist");
+        assert!(loaded.is_task_completed(1), "task 1 should still be completed");
+        assert!(!loaded.is_task_completed(2), "task 2 should not be completed");
+        assert!(!loaded.is_task_completed(3), "task 3 should not be completed");
     }
 }

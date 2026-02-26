@@ -70,8 +70,9 @@ pub fn run_phase1(
 ///
 /// Layout:
 /// ```text
-/// --print --plan --workspace <repo> --output-format text [--model <m>] <prompt>
+/// --print --plan --workspace <repo> --output-format text --model <m> <prompt>
 /// ```
+/// `<m>` is the config model when set, otherwise `"auto"`.
 fn phase1_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
     let mut args = vec![
         "--print".to_owned(),
@@ -82,10 +83,9 @@ fn phase1_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
         "text".to_owned(),
     ];
 
-    if let Some(ref model) = config.model {
-        args.push("--model".to_owned());
-        args.push(model.clone());
-    }
+    let model = config.model.as_deref().unwrap_or("auto");
+    args.push("--model".to_owned());
+    args.push(model.to_owned());
 
     args.push(prompt.to_owned());
     args
@@ -135,11 +135,9 @@ pub fn run_phase2(
 ///
 /// Layout:
 /// ```text
-/// --print --workspace <repo> --sandbox <sandbox> [--model <m>] <prompt>
+/// --print --workspace <repo> --sandbox <sandbox> --model <m> <prompt>
 /// ```
-///
-/// Phase 2 omits `--plan` (execution, not planning) and includes
-/// `--sandbox` from config.
+/// `<m>` is the config model when set, otherwise `"auto"`.
 fn phase2_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
     let mut args = vec![
         "--print".to_owned(),
@@ -149,10 +147,9 @@ fn phase2_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
         config.sandbox.clone(),
     ];
 
-    if let Some(ref model) = config.model {
-        args.push("--model".to_owned());
-        args.push(model.clone());
-    }
+    let model = config.model.as_deref().unwrap_or("auto");
+    args.push("--model".to_owned());
+    args.push(model.to_owned());
 
     args.push(prompt.to_owned());
     args
@@ -249,6 +246,12 @@ pub fn run_phase3_triage(
 }
 
 /// Build the argv for a Phase 3 invocation (same layout as Phase 2).
+///
+/// Layout:
+/// ```text
+/// --print --workspace <repo> --sandbox <sandbox> --model <m> <prompt>
+/// ```
+/// `<m>` is the config model when set, otherwise `"auto"`.
 fn phase3_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
     let mut args = vec![
         "--print".to_owned(),
@@ -258,10 +261,9 @@ fn phase3_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
         config.sandbox.clone(),
     ];
 
-    if let Some(ref model) = config.model {
-        args.push("--model".to_owned());
-        args.push(model.clone());
-    }
+    let model = config.model.as_deref().unwrap_or("auto");
+    args.push("--model".to_owned());
+    args.push(model.to_owned());
 
     args.push(prompt.to_owned());
     args
@@ -344,6 +346,8 @@ mod tests {
                 "/my/repo",
                 "--output-format",
                 "text",
+                "--model",
+                "auto",
                 "Do the thing.",
             ]
         );
@@ -452,6 +456,8 @@ mod tests {
                 "/my/repo",
                 "--sandbox",
                 "disabled",
+                "--model",
+                "auto",
                 "Execute this plan.",
             ]
         );
@@ -830,6 +836,8 @@ mod tests {
                 "/my/repo",
                 "--sandbox",
                 "disabled",
+                "--model",
+                "auto",
                 "Address findings.",
             ]
         );
