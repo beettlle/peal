@@ -601,17 +601,19 @@ D
         );
     }
 
-    /// Parses docs/plan-phase4.md, plan-phase5.md, plan-phase6.md and asserts
-    /// expected task counts and non-empty bodies.
+    /// Parses docs/plan-phase4.md, plan-phase5.md, plan-phase6.md, plan-phase7.md
+    /// and asserts expected task counts and non-empty bodies.
     #[test]
     fn parse_docs_phase4_phase5_phase6_plan_files() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let plan4 = parse_plan_file(&root.join("docs/plan-phase4.md")).unwrap();
         let plan5 = parse_plan_file(&root.join("docs/plan-phase5.md")).unwrap();
         let plan6 = parse_plan_file(&root.join("docs/plan-phase6.md")).unwrap();
+        let plan7 = parse_plan_file(&root.join("docs/plan-phase7.md")).unwrap();
         assert_eq!(plan4.tasks.len(), 7, "plan-phase4.md should have 7 tasks");
         assert_eq!(plan5.tasks.len(), 5, "plan-phase5.md should have 5 tasks");
         assert_eq!(plan6.tasks.len(), 3, "plan-phase6.md should have 3 tasks");
+        assert_eq!(plan7.tasks.len(), 4, "plan-phase7.md should have 4 tasks");
         for t in &plan4.tasks {
             assert!(
                 !t.content.trim().is_empty(),
@@ -630,6 +632,13 @@ D
             assert!(
                 !t.content.trim().is_empty(),
                 "phase6 task {} has non-empty body",
+                t.index
+            );
+        }
+        for t in &plan7.tasks {
+            assert!(
+                !t.content.trim().is_empty(),
+                "phase7 task {} has non-empty body",
                 t.index
             );
         }
