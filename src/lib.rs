@@ -5,6 +5,7 @@ pub mod error;
 pub mod logging;
 pub mod phase;
 pub mod plan;
+pub mod plan_prompt;
 pub mod prompt;
 pub mod runner;
 pub mod state;

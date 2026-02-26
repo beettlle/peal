@@ -17,6 +17,17 @@ pub struct Cli {
 pub enum Commands {
     /// Run the orchestrator on a plan file against a target repo.
     Run(RunArgs),
+
+    /// Print a prompt template for an LLM to produce a PEAL-compatible plan.
+    Prompt(PromptArgs),
+}
+
+/// Arguments for the `prompt` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct PromptArgs {
+    /// Write the prompt to this file instead of stdout.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 /// Arguments for the `run` subcommand.
@@ -118,6 +129,7 @@ mod tests {
                 assert_eq!(args.plan, Some(PathBuf::from("tasks.md")));
                 assert_eq!(args.repo, Some(PathBuf::from("/tmp/repo")));
             }
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }
     }
 
@@ -131,6 +143,7 @@ mod tests {
                 assert_eq!(args.plan, None);
                 assert_eq!(args.repo, None);
             }
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }
     }
 
@@ -178,6 +191,7 @@ mod tests {
                 assert_eq!(args.max_address_rounds, Some(5));
                 assert_eq!(args.stet_start_ref.as_deref(), Some("HEAD~1"));
             }
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }
     }
 
@@ -193,6 +207,7 @@ mod tests {
                 assert_eq!(args.task, Some(5));
                 assert_eq!(args.from_task, None);
             }
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }
     }
 
@@ -215,6 +230,7 @@ mod tests {
                 assert_eq!(args.task, None);
                 assert_eq!(args.from_task, Some(3));
             }
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }
     }
 
@@ -244,6 +260,27 @@ mod tests {
             err.kind(),
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
+    }
+
+    #[test]
+    fn prompt_subcommand_parses_without_output() {
+        let cli = Cli::try_parse_from(["peal", "prompt"]).expect("should parse");
+        match cli.command {
+            Commands::Prompt(args) => assert_eq!(args.output, None),
+            _ => panic!("expected Prompt subcommand"),
+        }
+    }
+
+    #[test]
+    fn prompt_subcommand_parses_with_output() {
+        let cli = Cli::try_parse_from(["peal", "prompt", "--output", "out.txt"])
+            .expect("should parse");
+        match cli.command {
+            Commands::Prompt(args) => {
+                assert_eq!(args.output, Some(PathBuf::from("out.txt")));
+            }
+            _ => panic!("expected Prompt subcommand"),
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ use peal::cli::{Cli, Commands};
 use peal::config::PealConfig;
 use peal::cursor;
 use peal::plan;
+use peal::plan_prompt;
 use peal::runner;
 use peal::state;
 use peal::stet;
@@ -26,6 +27,19 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Commands::Prompt(args) => {
+            let prompt = plan_prompt::plan_instructions_prompt();
+            match &args.output {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, prompt)?;
+                }
+                None => println!("{prompt}"),
+            }
+            Ok(())
+        }
         Commands::Run(args) => {
             let config_path = args.config.clone();
             let config = PealConfig::load(config_path.as_deref(), &args)?;
@@ -342,6 +356,32 @@ mod tests {
         assert!(
             err_msg.contains("plan_path is required"),
             "expected 'plan_path is required', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn prompt_writes_template_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("plan-prompt.txt");
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "prompt",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        run(cli).expect("prompt --output should succeed");
+
+        let content = fs::read_to_string(&out_path).expect("output file should exist");
+        assert!(
+            content.contains("## Task"),
+            "template must describe task heading format"
+        );
+        assert!(
+            content.contains("(parallel)"),
+            "template must describe parallel marker"
         );
     }
 }

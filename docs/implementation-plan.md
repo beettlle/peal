@@ -265,6 +265,12 @@ flowchart LR
 
 ---
 
+## Prompt subcommand
+
+`peal prompt` prints a prompt template that users can paste into an LLM (e.g. Cursor Ask) to generate a feature plan in the canonical format. No plan file or repo is required. Options: `--output <path>` writes the prompt to a file instead of stdout. Use case: user runs `peal prompt` (or `peal prompt --output plan-prompt.txt`), appends their PRD or notes, sends the combined text to the LLM, then saves the LLM’s reply as a plan file and runs `peal run --plan <path> --repo <path>`.
+
+---
+
 ## Summary
 
 - **Config:** TOML; precedence CLI > env > file.
