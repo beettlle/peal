@@ -122,6 +122,27 @@ fn read_bounded(reader: impl Read) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Parse a single command string into program and args (first token = program, rest = args).
+/// Exec-style: no shell, so args with spaces are not supported unless the user runs
+/// a single program that does its own parsing (e.g. `bash -c '...'`).
+///
+/// Returns `None` if the string is empty or only whitespace (caller should skip).
+/// Returns `Some(Ok(result))` or `Some(Err(e))` after calling `run_command`.
+pub fn run_command_string(
+    command: &str,
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Option<std::io::Result<CommandResult>> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = trimmed.split_ascii_whitespace().collect();
+    let program = tokens[0];
+    let args: Vec<&str> = tokens[1..].to_vec();
+    Some(run_command(program, &args, cwd, timeout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +249,28 @@ mod tests {
             timed_out: true,
         };
         assert!(!timed_out.success());
+    }
+
+    #[test]
+    fn run_command_string_parses_and_runs_echo_hello() {
+        let result = run_command_string("echo hello", &tmp_dir(), None).unwrap().unwrap();
+
+        assert_eq!(result.stdout.trim(), "hello");
+        assert!(result.stderr.is_empty());
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn run_command_string_empty_returns_none() {
+        assert!(run_command_string("", &tmp_dir(), None).is_none());
+        assert!(run_command_string("   ", &tmp_dir(), None).is_none());
+    }
+
+    #[test]
+    fn run_command_string_single_token() {
+        let result = run_command_string("true", &tmp_dir(), None).unwrap().unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
     }
 }

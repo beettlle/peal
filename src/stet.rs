@@ -1306,8 +1306,10 @@ exit 0
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1316,6 +1318,9 @@ exit 0
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
         let run_stdout = r#"{"findings":[{"id":"f1","message":"unused"}]}"#;
         let result = dismiss_non_actionable_and_rerun(&stet_path, &agent_path, &config, run_stdout).unwrap();
@@ -1339,8 +1344,10 @@ exit 0
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1524,8 +1531,10 @@ exit 0
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1534,6 +1543,9 @@ exit 0
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let stet_result = StetRunResult {
@@ -1583,8 +1595,10 @@ exit 0
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1593,6 +1607,9 @@ exit 0
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let stet_result = StetRunResult {
@@ -1664,8 +1681,10 @@ exit 0
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1674,6 +1693,9 @@ exit 0
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let initial = StetRunResult {
@@ -1713,8 +1735,10 @@ exit 0
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1723,6 +1747,9 @@ exit 0
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let initial = StetRunResult {
@@ -1760,8 +1787,10 @@ exit 0
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1770,6 +1799,9 @@ exit 0
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let initial = StetRunResult {
@@ -1888,8 +1920,10 @@ exit 0
             on_findings_remaining: "warn".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -1898,6 +1932,9 @@ exit 0
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let initial = StetRunResult {

@@ -56,20 +56,62 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None => info!("stet not found, phase 3 will be skipped"),
             }
 
+            let mut run_stet_path = stet_path.clone();
             if let Some(ref sp) = stet_path {
                 info!("starting stet session");
-                let stet_out = stet::start_session(
-                    sp,
-                    config.stet_start_ref.as_deref(),
-                    &config.stet_start_extra_args,
-                    &config.repo_path,
-                    Some(Duration::from_secs(config.phase_timeout_sec)),
-                )?;
-                info!(
-                    stdout_len = stet_out.stdout.len(),
-                    stderr_len = stet_out.stderr.len(),
-                    "stet session started"
-                );
+                let start_result = match config.on_stet_fail.as_str() {
+                    "retry_once" => {
+                        match stet::start_session(
+                            sp,
+                            config.stet_start_ref.as_deref(),
+                            &config.stet_start_extra_args,
+                            &config.repo_path,
+                            Some(Duration::from_secs(config.phase_timeout_sec)),
+                        ) {
+                            Ok(out) => Ok(out),
+                            Err(e) => {
+                                warn!(err = %e, "stet start failed, retrying once");
+                                stet::start_session(
+                                    sp,
+                                    config.stet_start_ref.as_deref(),
+                                    &config.stet_start_extra_args,
+                                    &config.repo_path,
+                                    Some(Duration::from_secs(config.phase_timeout_sec)),
+                                )
+                            }
+                        }
+                    }
+                    "skip" => stet::start_session(
+                        sp,
+                        config.stet_start_ref.as_deref(),
+                        &config.stet_start_extra_args,
+                        &config.repo_path,
+                        Some(Duration::from_secs(config.phase_timeout_sec)),
+                    )
+                    .or_else(|e| {
+                        warn!(err = %e, "stet start failed; stet phase skipped for this run");
+                        run_stet_path = None;
+                        Ok(stet::StetOutput {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        })
+                    }),
+                    _ => stet::start_session(
+                        sp,
+                        config.stet_start_ref.as_deref(),
+                        &config.stet_start_extra_args,
+                        &config.repo_path,
+                        Some(Duration::from_secs(config.phase_timeout_sec)),
+                    ),
+                };
+                let stet_out = start_result?;
+                if run_stet_path.is_some() {
+                    info!(
+                        stdout_len = stet_out.stdout.len(),
+                        stderr_len = stet_out.stderr.len(),
+                        "stet session started"
+                    );
+                }
             }
 
             info!(
@@ -97,6 +139,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 (None, None) => parsed,
                 _ => unreachable!("clap prevents both --task and --from-task"),
             };
+
+            if parsed.tasks.is_empty() {
+                return Err(peal::error::PealError::InvalidPlanFile {
+                    path: config.plan_path.clone(),
+                }
+                .into());
+            }
 
             info!(
                 task_count = parsed.tasks.len(),
@@ -143,10 +192,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 &parsed,
                 &mut peal_state,
                 &config.state_dir,
-                stet_path.as_deref(),
+                run_stet_path.as_deref(),
             );
 
-            if let Some(ref sp) = stet_path {
+            if let Some(ref sp) = run_stet_path {
                 let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
                 match stet::finish_session(sp, &config.repo_path, timeout) {
                     Ok(out) => info!(
@@ -159,6 +208,70 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
 
             let results = run_result?;
+
+            if !config.post_run_commands.is_empty() {
+                let timeout = config
+                    .post_run_timeout_sec
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_secs(config.phase_timeout_sec));
+                info!(
+                    count = config.post_run_commands.len(),
+                    "running post-run command(s)"
+                );
+                for cmd in &config.post_run_commands {
+                    let cmd = cmd.trim();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    info!(command = %cmd, "running post-run command");
+                    match peal::subprocess::run_command_string(cmd, &config.repo_path, Some(timeout))
+                    {
+                        None => {}
+                        Some(Ok(result)) => {
+                            const TRUNCATE_BYTES: usize = 2048;
+                            let truncate = |s: &str, max: usize| {
+                                if s.len() <= max {
+                                    s
+                                } else {
+                                    let end = s.floor_char_boundary(max);
+                                    &s[..end]
+                                }
+                            };
+                            if result.success() {
+                                info!(
+                                    stdout_len = result.stdout.len(),
+                                    stderr_len = result.stderr.len(),
+                                    exit_code = ?result.exit_code,
+                                    "post-run command succeeded"
+                                );
+                                if !result.stdout.is_empty() {
+                                    info!(stdout = %truncate(result.stdout.trim(), TRUNCATE_BYTES), "post-run stdout");
+                                }
+                                if !result.stderr.is_empty() {
+                                    info!(stderr = %truncate(result.stderr.trim(), TRUNCATE_BYTES), "post-run stderr");
+                                }
+                            } else {
+                                warn!(
+                                    stdout_len = result.stdout.len(),
+                                    stderr_len = result.stderr.len(),
+                                    exit_code = ?result.exit_code,
+                                    timed_out = result.timed_out,
+                                    "post-run command failed (best-effort)"
+                                );
+                                if !result.stdout.is_empty() {
+                                    warn!(stdout = %truncate(result.stdout.trim(), TRUNCATE_BYTES), "post-run stdout");
+                                }
+                                if !result.stderr.is_empty() {
+                                    warn!(stderr = %truncate(result.stderr.trim(), TRUNCATE_BYTES), "post-run stderr");
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!(error = %e, "post-run command spawn failed (best-effort)");
+                        }
+                    }
+                }
+            }
 
             for r in &results {
                 info!(
@@ -196,9 +309,70 @@ mod tests {
         let result = run(cli);
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("does not exist"),
-            "expected 'does not exist', got: {err_msg}"
+            err_msg.contains("Invalid or missing plan file"),
+            "expected 'Invalid or missing plan file', got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn run_fails_when_plan_has_no_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "No ## Task headings here.\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .ok();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "echo",
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        let result = run(cli);
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Invalid or missing plan file"),
+            "expected 'Invalid or missing plan file', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn run_fails_when_agent_cmd_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "nonexistent-binary-xyz",
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        let result = run(cli);
+        let err = result.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("not found"), "expected 'not found' in error: {}", msg);
+        assert!(msg.contains("docs.cursor.com/cli"), "expected install link in error: {}", msg);
     }
 
     #[test]
@@ -231,6 +405,7 @@ mod tests {
     #[test]
     fn run_succeeds_with_valid_inputs() {
         let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
         let plan_path = dir.path().join("plan.md");
         fs::write(&plan_path, "## Task 1\nDo something").unwrap();
 
@@ -254,6 +429,7 @@ mod tests {
     #[test]
     fn run_succeeds_with_config_file() {
         let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
         let plan_path = dir.path().join("plan.md");
         fs::write(&plan_path, "## Task 1\nDo something").unwrap();
 
@@ -277,6 +453,7 @@ mod tests {
     #[test]
     fn run_with_task_flag_runs_single_task() {
         let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
         let plan_path = dir.path().join("plan.md");
         fs::write(
             &plan_path,
@@ -317,6 +494,7 @@ mod tests {
     #[test]
     fn run_with_from_task_flag_runs_tail() {
         let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
         let plan_path = dir.path().join("plan.md");
         fs::write(
             &plan_path,
@@ -390,5 +568,68 @@ mod tests {
             content.contains("(parallel)"),
             "template must describe parallel marker"
         );
+    }
+
+    #[test]
+    fn run_with_failing_post_run_command_still_exits_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo something").unwrap();
+
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                "plan_path = {:?}\nrepo_path = {:?}\nagent_cmd = \"echo\"\npost_run_commands = [\"false\"]\n",
+                plan_path.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        let result = run(cli);
+        result.expect("post-run failure is best-effort; peal should still exit success");
+    }
+
+    #[test]
+    fn run_with_post_run_commands_echo_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo something").unwrap();
+
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                "plan_path = {:?}\nrepo_path = {:?}\nagent_cmd = \"echo\"\npost_run_commands = [\"echo\", \"hello\"]\n",
+                plan_path.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        run(cli).expect("run with post_run_commands echo hello should succeed");
     }
 }

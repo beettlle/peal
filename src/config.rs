@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::Deserialize;
 
@@ -15,7 +16,9 @@ const DEFAULT_MAX_ADDRESS_ROUNDS: u32 = 5;
 const DEFAULT_ON_FINDINGS_REMAINING: &str = "fail";
 const DEFAULT_STATE_DIR: &str = ".peal";
 const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 1800;
+const DEFAULT_PHASE_RETRY_COUNT: u32 = 0;
 const DEFAULT_MAX_PARALLEL: u32 = 4;
+const DEFAULT_ON_STET_FAIL: &str = "fail";
 
 /// Valid dismiss reasons for stet (must match `stet dismiss <id> <reason>`).
 pub const STET_DISMISS_REASONS: [&str; 4] = [
@@ -56,6 +59,7 @@ pub struct PealConfig {
     pub on_findings_remaining: String,
     pub state_dir: PathBuf,
     pub phase_timeout_sec: u64,
+    pub phase_retry_count: u32,
     pub parallel: bool,
     pub max_parallel: u32,
     /// When true, a task failure in a parallel block does not stop the run:
@@ -76,6 +80,14 @@ pub struct PealConfig {
     /// When LLM triage is disabled, match finding message/path against these patterns; if match, dismiss with reason.
     /// Empty when LLM triage is enabled or not configured.
     pub stet_dismiss_patterns: Vec<StetDismissPattern>,
+    /// Behavior when stet start or stet run fails: "fail" (default), "retry_once", or "skip".
+    pub on_stet_fail: String,
+    /// Commands run after all tasks succeed (and after stet finish when stet is used).
+    /// Working directory = repo_path; stdout/stderr captured and logged; best-effort, no Cursor call.
+    /// Each string is split on whitespace: first token = program, rest = args (exec-style, no shell).
+    pub post_run_commands: Vec<String>,
+    /// Timeout in seconds for each post-run command. When None, phase_timeout_sec is used.
+    pub post_run_timeout_sec: Option<u64>,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -92,6 +104,7 @@ struct FileConfig {
     on_findings_remaining: Option<String>,
     state_dir: Option<PathBuf>,
     phase_timeout_sec: Option<u64>,
+    phase_retry_count: Option<u32>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
     continue_with_remaining_tasks: Option<bool>,
@@ -103,6 +116,9 @@ struct FileConfig {
     stet_run_extra_args: Option<Vec<String>>,
     stet_disable_llm_triage: Option<bool>,
     stet_dismiss_patterns: Option<Vec<StetDismissPattern>>,
+    on_stet_fail: Option<String>,
+    post_run_commands: Option<Vec<String>>,
+    post_run_timeout_sec: Option<u64>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -118,6 +134,7 @@ struct ConfigLayer {
     on_findings_remaining: Option<String>,
     state_dir: Option<PathBuf>,
     phase_timeout_sec: Option<u64>,
+    phase_retry_count: Option<u32>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
     continue_with_remaining_tasks: Option<bool>,
@@ -129,6 +146,9 @@ struct ConfigLayer {
     stet_run_extra_args: Option<Vec<String>>,
     stet_disable_llm_triage: Option<bool>,
     stet_dismiss_patterns: Option<Vec<StetDismissPattern>>,
+    on_stet_fail: Option<String>,
+    post_run_commands: Option<Vec<String>>,
+    post_run_timeout_sec: Option<u64>,
 }
 
 impl PealConfig {
@@ -164,9 +184,22 @@ impl PealConfig {
                 path: self.repo_path.clone(),
             });
         }
+        if !is_git_repo(&self.repo_path) {
+            return Err(crate::error::PealError::RepoNotGitRepo {
+                path: self.repo_path.clone(),
+            });
+        }
         if self.on_findings_remaining != "fail" && self.on_findings_remaining != "warn" {
             return Err(crate::error::PealError::InvalidOnFindingsRemaining {
                 value: self.on_findings_remaining.clone(),
+            });
+        }
+        if self.on_stet_fail != "fail"
+            && self.on_stet_fail != "retry_once"
+            && self.on_stet_fail != "skip"
+        {
+            return Err(crate::error::PealError::InvalidOnStetFail {
+                value: self.on_stet_fail.clone(),
             });
         }
         Ok(())
@@ -216,6 +249,9 @@ impl PealConfig {
             phase_timeout_sec: merged
                 .phase_timeout_sec
                 .unwrap_or(DEFAULT_PHASE_TIMEOUT_SEC),
+            phase_retry_count: merged
+                .phase_retry_count
+                .unwrap_or(DEFAULT_PHASE_RETRY_COUNT),
             parallel: merged.parallel.unwrap_or(false),
             max_parallel: merged.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL),
             continue_with_remaining_tasks: merged.continue_with_remaining_tasks.unwrap_or(false),
@@ -232,6 +268,11 @@ impl PealConfig {
             merged.stet_dismiss_patterns.unwrap_or_default(),
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?,
+        on_stet_fail: merged
+            .on_stet_fail
+            .unwrap_or_else(|| DEFAULT_ON_STET_FAIL.to_owned()),
+        post_run_commands: merged.post_run_commands.unwrap_or_default(),
+        post_run_timeout_sec: merged.post_run_timeout_sec,
     })
     }
 }
@@ -252,6 +293,7 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         on_findings_remaining: fc.on_findings_remaining,
         state_dir: fc.state_dir,
         phase_timeout_sec: fc.phase_timeout_sec,
+        phase_retry_count: fc.phase_retry_count,
         parallel: fc.parallel,
         max_parallel: fc.max_parallel,
         continue_with_remaining_tasks: fc.continue_with_remaining_tasks,
@@ -263,7 +305,26 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         stet_run_extra_args: fc.stet_run_extra_args,
         stet_disable_llm_triage: fc.stet_disable_llm_triage,
         stet_dismiss_patterns: fc.stet_dismiss_patterns,
+        on_stet_fail: fc.on_stet_fail,
+        post_run_commands: fc.post_run_commands,
+        post_run_timeout_sec: fc.post_run_timeout_sec,
     })
+}
+
+/// Returns true if `path` is the root of a git worktree (or inside one).
+fn is_git_repo(path: &Path) -> bool {
+    let output = match Command::new("git")
+        .args(["-C", path.as_os_str(), "rev-parse", "--is-inside-work-tree"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim() == "true"
 }
 
 fn real_env_var(suffix: &str) -> Option<String> {
@@ -286,6 +347,7 @@ fn load_env_layer(
         on_findings_remaining: env_fn("ON_FINDINGS_REMAINING"),
         state_dir: env_fn("STATE_DIR").map(PathBuf::from),
         phase_timeout_sec: parse_env_u64(env_fn, "PHASE_TIMEOUT_SEC")?,
+        phase_retry_count: parse_env_u32(env_fn, "PHASE_RETRY_COUNT")?,
         parallel: parse_env_bool(env_fn, "PARALLEL")?,
         max_parallel: parse_env_u32(env_fn, "MAX_PARALLEL")?,
         continue_with_remaining_tasks: parse_env_bool(env_fn, "CONTINUE_WITH_REMAINING_TASKS")?,
@@ -301,6 +363,10 @@ fn load_env_layer(
             .map(parse_extra_args_str),
         stet_disable_llm_triage: parse_env_bool(env_fn, "STET_DISABLE_LLM_TRIAGE")?,
         stet_dismiss_patterns: env_fn("STET_DISMISS_PATTERNS").as_deref().map(parse_dismiss_patterns),
+        on_stet_fail: env_fn("ON_STET_FAIL"),
+        post_run_commands: env_fn("POST_RUN_COMMANDS")
+            .map(|s| s.split(',').map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).collect()),
+        post_run_timeout_sec: parse_env_u64(env_fn, "POST_RUN_TIMEOUT_SEC")?,
     })
 }
 
@@ -403,6 +469,7 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         sandbox: args.sandbox.clone(),
         state_dir: args.state_dir.clone(),
         phase_timeout_sec: args.phase_timeout_sec,
+        phase_retry_count: args.phase_retry_count,
         parallel: if args.parallel { Some(true) } else { None },
         max_parallel: args.max_parallel,
         continue_with_remaining_tasks: if args.continue_with_remaining_tasks {
@@ -424,6 +491,12 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         stet_run_extra_args: args.stet_run_args.as_deref().map(parse_extra_args_str),
         stet_disable_llm_triage: args.stet_disable_llm_triage,
         stet_dismiss_patterns: None,
+        on_stet_fail: args.on_stet_fail.clone(),
+        post_run_commands: args
+            .post_run_commands
+            .as_deref()
+            .map(|s| s.split(',').map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).collect()),
+        post_run_timeout_sec: args.post_run_timeout_sec,
     }
 }
 
@@ -452,6 +525,10 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .phase_timeout_sec
             .or(env.phase_timeout_sec)
             .or(file.phase_timeout_sec),
+        phase_retry_count: cli
+            .phase_retry_count
+            .or(env.phase_retry_count)
+            .or(file.phase_retry_count),
         parallel: cli.parallel.or(env.parallel).or(file.parallel),
         max_parallel: cli.max_parallel.or(env.max_parallel).or(file.max_parallel),
         continue_with_remaining_tasks: cli
@@ -481,6 +558,15 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .stet_dismiss_patterns
             .or(env.stet_dismiss_patterns)
             .or(file.stet_dismiss_patterns),
+        on_stet_fail: cli.on_stet_fail.or(env.on_stet_fail).or(file.on_stet_fail),
+        post_run_commands: cli
+            .post_run_commands
+            .or(env.post_run_commands)
+            .or(file.post_run_commands),
+        post_run_timeout_sec: cli
+            .post_run_timeout_sec
+            .or(env.post_run_timeout_sec)
+            .or(file.post_run_timeout_sec),
     }
 }
 
@@ -502,11 +588,13 @@ mod tests {
             sandbox: None,
             state_dir: None,
             phase_timeout_sec: None,
+            phase_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
             max_address_rounds: None,
             on_findings_remaining: None,
+            on_stet_fail: None,
             task: None,
             from_task: None,
             log_level: None,
@@ -516,6 +604,8 @@ mod tests {
             stet_start_args: None,
             stet_run_args: None,
             stet_disable_llm_triage: None,
+            post_run_commands: None,
+            post_run_timeout_sec: None,
         }
     }
 
@@ -536,6 +626,76 @@ mod tests {
         assert_eq!(cfg.phase_timeout_sec, 1800);
         assert!(!cfg.parallel);
         assert_eq!(cfg.max_parallel, 4);
+    }
+
+    #[test]
+    fn documented_example_toml_parses_successfully() {
+        // Matches docs/configuration.md "Full TOML example" to avoid drift.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+# Required (or provide via --plan / --repo or PEAL_PLAN_PATH / PEAL_REPO_PATH)
+plan_path = "plans/my-plan.md"
+repo_path = "/path/to/repo"
+
+# Optional: Cursor CLI and execution
+agent_cmd = "agent"
+state_dir = ".peal"
+phase_timeout_sec = 1800
+parallel = true
+max_parallel = 4
+on_findings_remaining = "fail"
+
+# Optional: stet integration
+stet_commands = ["stet start HEAD~1", "stet run"]
+stet_start_extra_args = ["--allow-dirty"]
+stet_run_extra_args = ["--verify", "--context", "256k"]
+stet_disable_llm_triage = false
+stet_dismiss_patterns = [
+  { pattern = "generated", reason = "out_of_scope" },
+  { pattern = "false positive", reason = "false_positive" }
+]
+
+# Optional: post-run commands (e.g. stet finish)
+post_run_commands = ["stet finish", "echo done"]
+post_run_timeout_sec = 60
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+
+        assert_eq!(cfg.plan_path, PathBuf::from("plans/my-plan.md"));
+        assert_eq!(cfg.repo_path, PathBuf::from("/path/to/repo"));
+        assert_eq!(cfg.agent_cmd, "agent");
+        assert_eq!(cfg.state_dir, PathBuf::from(".peal"));
+        assert_eq!(cfg.phase_timeout_sec, 1800);
+        assert!(cfg.parallel);
+        assert_eq!(cfg.max_parallel, 4);
+        assert_eq!(cfg.on_findings_remaining, "fail");
+        assert_eq!(
+            cfg.stet_commands,
+            vec!["stet start HEAD~1", "stet run"]
+        );
+        assert_eq!(cfg.stet_start_extra_args, vec!["--allow-dirty"]);
+        assert_eq!(
+            cfg.stet_run_extra_args,
+            vec!["--verify", "--context", "256k"]
+        );
+        assert!(!cfg.stet_disable_llm_triage);
+        assert_eq!(cfg.stet_dismiss_patterns.len(), 2);
+        assert_eq!(cfg.stet_dismiss_patterns[0].pattern, "generated");
+        assert_eq!(cfg.stet_dismiss_patterns[0].reason, "out_of_scope");
+        assert_eq!(cfg.stet_dismiss_patterns[1].pattern, "false positive");
+        assert_eq!(cfg.stet_dismiss_patterns[1].reason, "false_positive");
+        assert_eq!(
+            cfg.post_run_commands,
+            vec!["stet finish", "echo done"]
+        );
+        assert_eq!(cfg.post_run_timeout_sec, Some(60));
     }
 
     #[test]
@@ -619,11 +779,13 @@ model = "from-file"
             sandbox: None,
             state_dir: None,
             phase_timeout_sec: None,
+            phase_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
             max_address_rounds: None,
             on_findings_remaining: None,
+            on_stet_fail: None,
             task: None,
             from_task: None,
             log_level: None,
@@ -633,6 +795,8 @@ model = "from-file"
             stet_start_args: None,
             stet_run_args: None,
             stet_disable_llm_triage: None,
+            post_run_commands: None,
+            post_run_timeout_sec: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
 
@@ -688,11 +852,13 @@ agent_cmd = "from-file"
             sandbox: None,
             state_dir: None,
             phase_timeout_sec: None,
+            phase_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
             max_address_rounds: None,
             on_findings_remaining: None,
+            on_stet_fail: None,
             task: None,
             from_task: None,
             log_level: None,
@@ -702,6 +868,8 @@ agent_cmd = "from-file"
             stet_start_args: None,
             stet_run_args: None,
             stet_disable_llm_triage: None,
+            post_run_commands: None,
+            post_run_timeout_sec: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
 
@@ -796,6 +964,8 @@ bogus_key = true
             stet_start_args: None,
             stet_run_args: None,
             stet_disable_llm_triage: None,
+            post_run_commands: None,
+            post_run_timeout_sec: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
 
@@ -808,6 +978,7 @@ bogus_key = true
     #[test]
     fn validate_succeeds_with_valid_file_and_directory() {
         let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
         let plan_path = dir.path().join("plan.md");
         fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
 
@@ -889,6 +1060,43 @@ bogus_key = true
     }
 
     #[test]
+    fn validate_fails_when_repo_not_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
+        // Do not run git init; dir is not a git repo.
+
+        let args = minimal_cli_args(Some(plan_path), Some(dir.path().to_path_buf()));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a git repository"),
+            "expected 'not a git repository', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_on_stet_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
+
+        let mut args = minimal_cli_args(Some(plan_path), Some(dir.path().to_path_buf()));
+        args.on_stet_fail = Some("invalid".to_owned());
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Invalid on_stet_fail"),
+            "expected Invalid on_stet_fail, got: {msg}"
+        );
+    }
+
+    #[test]
     fn partial_toml_fills_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("peal.toml");
@@ -946,11 +1154,13 @@ sandbox = "file-sandbox"
             sandbox: None,
             state_dir: None,
             phase_timeout_sec: None,
+            phase_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
             max_address_rounds: None,
             on_findings_remaining: None,
+            on_stet_fail: None,
             task: None,
             from_task: None,
             log_level: None,
@@ -960,6 +1170,8 @@ sandbox = "file-sandbox"
             stet_start_args: None,
             stet_run_args: None,
             stet_disable_llm_triage: None,
+            post_run_commands: None,
+            post_run_timeout_sec: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
 
@@ -1059,6 +1271,7 @@ on_findings_remaining = "warn"
     #[test]
     fn validate_rejects_invalid_on_findings_remaining() {
         let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
         let plan_path = dir.path().join("plan.md");
         fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
 
@@ -1130,5 +1343,59 @@ stet_run_extra_args = ["--verify", "--context", "256k"]
             vec!["--a", "--b", "256k"]
         );
         assert_eq!(parse_extra_args_str(""), vec![] as Vec<String>);
+    }
+
+    #[test]
+    fn post_run_commands_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+post_run_commands = ["stet finish", "echo done"]
+post_run_timeout_sec = 60
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+
+        assert_eq!(
+            cfg.post_run_commands,
+            vec!["stet finish", "echo done"]
+        );
+        assert_eq!(cfg.post_run_timeout_sec, Some(60));
+    }
+
+    #[test]
+    fn post_run_commands_default_empty_and_no_timeout() {
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        assert!(cfg.post_run_commands.is_empty());
+        assert_eq!(cfg.post_run_timeout_sec, None);
+    }
+
+    #[test]
+    fn post_run_commands_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            match suffix {
+                "POST_RUN_COMMANDS" => Some("stet finish, echo done".to_owned()),
+                "POST_RUN_TIMEOUT_SEC" => Some("120".to_owned()),
+                _ => None,
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+
+        assert_eq!(
+            cfg.post_run_commands,
+            vec!["stet finish", "echo done"]
+        );
+        assert_eq!(cfg.post_run_timeout_sec, Some(120));
     }
 }

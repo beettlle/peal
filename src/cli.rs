@@ -68,6 +68,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub phase_timeout_sec: Option<u64>,
 
+    /// Number of retries per phase on timeout or non-zero exit (default: 0).
+    #[arg(long)]
+    pub phase_retry_count: Option<u32>,
+
     /// Enable parallel execution of parallel-marked tasks.
     #[arg(long, default_value_t = false)]
     pub parallel: bool,
@@ -88,6 +92,10 @@ pub struct RunArgs {
     /// "fail" (default) returns an error; "warn" logs a warning and continues.
     #[arg(long)]
     pub on_findings_remaining: Option<String>,
+
+    /// Behavior when stet start or stet run fails: "fail" (default), "retry_once", or "skip".
+    #[arg(long)]
+    pub on_stet_fail: Option<String>,
 
     /// Run only the task with this index.
     #[arg(long, conflicts_with = "from_task")]
@@ -129,6 +137,14 @@ pub struct RunArgs {
     /// Disable LLM triage for stet findings; use rule-based dismiss patterns only.
     #[arg(long)]
     pub stet_disable_llm_triage: Option<bool>,
+
+    /// Commands to run after all tasks succeed (comma-separated). Exec-style: no shell.
+    #[arg(long)]
+    pub post_run_commands: Option<String>,
+
+    /// Timeout in seconds for each post-run command. When omitted, phase timeout is used.
+    #[arg(long)]
+    pub post_run_timeout_sec: Option<u64>,
 }
 
 #[cfg(test)]
@@ -188,6 +204,10 @@ mod tests {
             "--parallel",
             "--max-parallel",
             "8",
+            "--phase-retry-count",
+            "1",
+            "--on-stet-fail",
+            "skip",
             "--max-address-rounds",
             "5",
             "--stet-start-ref",
@@ -195,6 +215,9 @@ mod tests {
             "--stet-start-args=--allow-dirty",
             "--stet-run-args=--verify --context 256k",
             "--continue-with-remaining-tasks",
+            "--post-run-commands=stet finish, echo done",
+            "--post-run-timeout-sec",
+            "90",
         ])
         .expect("should parse all flags");
 
@@ -206,6 +229,7 @@ mod tests {
                 assert_eq!(args.sandbox.as_deref(), Some("enabled"));
                 assert_eq!(args.state_dir, Some(PathBuf::from(".my-state")));
                 assert_eq!(args.phase_timeout_sec, Some(600));
+                assert_eq!(args.phase_retry_count, Some(1));
                 assert!(args.parallel);
                 assert_eq!(args.max_parallel, Some(8));
                 assert!(args.continue_with_remaining_tasks);
@@ -216,6 +240,9 @@ mod tests {
                     args.stet_run_args.as_deref(),
                     Some("--verify --context 256k")
                 );
+                assert_eq!(args.on_stet_fail.as_deref(), Some("skip"));
+                assert_eq!(args.post_run_commands.as_deref(), Some("stet finish, echo done"));
+                assert_eq!(args.post_run_timeout_sec, Some(90));
             }
             Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }

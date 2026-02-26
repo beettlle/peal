@@ -10,11 +10,14 @@ pub enum PealError {
     #[error("Target path is not a directory: {path}")]
     RepoNotDirectory { path: PathBuf },
 
-    #[error("Plan file does not exist: {path}")]
+    #[error("Invalid or missing plan file: {path}")]
     PlanFileNotFound { path: PathBuf },
 
     #[error("Repo path does not exist: {path}")]
     RepoPathNotFound { path: PathBuf },
+
+    #[error("Target path is not a git repository: {path}")]
+    RepoNotGitRepo { path: PathBuf },
 
     #[error(
         "Cursor CLI command '{cmd}' not found on PATH. \
@@ -72,4 +75,7 @@ pub enum PealError {
 
     #[error("Invalid stet_dismiss_patterns reason '{value}' (expected one of: false_positive, already_correct, wrong_suggestion, out_of_scope)")]
     InvalidStetDismissReason { value: String },
+
+    #[error("Invalid on_stet_fail value '{value}' (expected \"fail\", \"retry_once\", or \"skip\")")]
+    InvalidOnStetFail { value: String },
 }

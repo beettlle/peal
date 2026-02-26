@@ -16,6 +16,48 @@ use crate::plan::ParsedPlan;
 use crate::state::{self, PealState};
 use crate::stet;
 
+/// Run stet review with on_stet_fail policy. Returns Ok(Some(result)) on success,
+/// Ok(None) when policy is "skip" and run failed, Err when policy is "fail" or "retry_once" exhausted.
+fn run_stet_review_with_policy(
+    stet_path: &Path,
+    repo_path: &Path,
+    extra_args: &[String],
+    timeout: Option<Duration>,
+    on_stet_fail: &str,
+    task_index: u32,
+    peal_state: &mut PealState,
+    state_dir: &Path,
+) -> Result<Option<stet::StetRunResult>, PealError> {
+    let first = stet::run_review(stet_path, repo_path, extra_args, timeout);
+    match first {
+        Ok(r) => return Ok(Some(r)),
+        Err(e) => {
+            if on_stet_fail == "retry_once" {
+                warn!(task_index, err = %e, "stet run failed, retrying once");
+                match stet::run_review(stet_path, repo_path, extra_args, timeout) {
+                    Ok(r) => return Ok(Some(r)),
+                    Err(e2) => {
+                        error!(task_index, err = %e2, "stet run failed");
+                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                            error!(err = %save_err, "failed to save state after stet failure");
+                        }
+                        return Err(e2);
+                    }
+                }
+            }
+            if on_stet_fail == "skip" {
+                warn!(task_index, err = %e, "stet phase skipped");
+                return Ok(None);
+            }
+            error!(task_index, err = %e, "stet run failed");
+            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                error!(err = %save_err, "failed to save state after stet failure");
+            }
+            return Err(e);
+        }
+    }
+}
+
 /// The result of running Phase 1 for a single task.
 #[derive(Debug, Clone)]
 pub struct TaskPhase1Result {
@@ -203,31 +245,67 @@ fn run_single_task(
             "phase 3: running stet review"
         );
 
-        let stet_result = stet::run_review(
+        let stet_result = run_stet_review_with_policy(
             sp,
             &config.repo_path,
             &config.stet_run_extra_args,
             timeout,
-        )
-            .map_err(|e| {
-                error!(task_index = task.index, err = %e, "stet run failed");
-                if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                    error!(err = %save_err, "failed to save state after stet failure");
-                }
-                e
-            })?;
+            config.on_stet_fail.as_str(),
+            task.index,
+            peal_state,
+            state_dir,
+        )?;
+
+        let stet_result = match stet_result {
+            Some(r) => r,
+            None => {
+                // skip: stet run failed, phase 3 skipped for this task
+                info!(task_index = task.index, "phase 3 skipped (stet run failed)");
+                peal_state.mark_task_completed(task.index);
+                state::save_state(peal_state, state_dir)?;
+                return Ok(TaskResult {
+                    task_index: task.index,
+                    plan_text: p1_output.stdout,
+                    phase2_stdout: p2_output.stdout,
+                    phase3_outcome: None,
+                });
+            }
+        };
 
         if stet_result.has_findings {
             info!(task_index = task.index, "phase 3: findings detected, starting address loop");
 
-            let outcome = stet::address_loop(agent_path, sp, config, task.index, &stet_result)
-                .map_err(|e| {
-                    error!(task_index = task.index, err = %e, "address loop failed");
-                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                        error!(err = %save_err, "failed to save state after address failure");
+            let outcome = match stet::address_loop(agent_path, sp, config, task.index, &stet_result) {
+                Ok(o) => o,
+                Err(e) => {
+                    if config.on_stet_fail == "retry_once" {
+                        warn!(task_index = task.index, err = %e, "address loop failed, retrying once");
+                        match stet::address_loop(agent_path, sp, config, task.index, &stet_result) {
+                            Ok(o) => o,
+                            Err(e2) => {
+                                error!(task_index = task.index, err = %e2, "address loop failed after retry");
+                                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                    error!(err = %save_err, "failed to save state after address failure");
+                                }
+                                return Err(e2);
+                            }
+                        }
+                    } else if config.on_stet_fail == "skip" {
+                        warn!(task_index = task.index, err = %e, "stet phase skipped");
+                        stet::AddressLoopOutcome {
+                            rounds_used: 0,
+                            findings_resolved: false,
+                            last_stet_result: stet_result.clone(),
+                        }
+                    } else {
+                        error!(task_index = task.index, err = %e, "address loop failed");
+                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                            error!(err = %save_err, "failed to save state after address failure");
+                        }
+                        return Err(e);
                     }
-                    e
-                })?;
+                }
+            };
 
             info!(
                 task_index = task.index,
@@ -505,31 +583,59 @@ pub fn run_scheduled(
                                         "phase 3: running stet review"
                                     );
 
-                                    let stet_result = stet::run_review(
+                                    let stet_result = run_stet_review_with_policy(
                                         sp,
                                         &config.repo_path,
                                         &config.stet_run_extra_args,
                                         timeout,
-                                    )
-                                        .map_err(|e| {
-                                            error!(task_index = idx, err = %e, "stet run failed");
-                                            if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                                                error!(err = %save_err, "failed to save state after stet failure");
-                                            }
-                                            e
-                                        })?;
+                                        config.on_stet_fail.as_str(),
+                                        idx,
+                                        peal_state,
+                                        state_dir,
+                                    )?;
+
+                                    let stet_result = match stet_result {
+                                        Some(r) => r,
+                                        None => {
+                                            info!(task_index = idx, "phase 3 skipped (stet run failed)");
+                                            return Ok(None);
+                                        }
+                                    };
 
                                     if stet_result.has_findings {
                                         info!(task_index = idx, "phase 3: findings detected, starting address loop");
 
-                                        let outcome = stet::address_loop(agent_path, sp, config, idx, &stet_result)
-                                            .map_err(|e| {
-                                                error!(task_index = idx, err = %e, "address loop failed");
-                                                if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                                                    error!(err = %save_err, "failed to save state after address failure");
+                                        let outcome = match stet::address_loop(agent_path, sp, config, idx, &stet_result) {
+                                            Ok(o) => o,
+                                            Err(e) => {
+                                                if config.on_stet_fail == "retry_once" {
+                                                    warn!(task_index = idx, err = %e, "address loop failed, retrying once");
+                                                    match stet::address_loop(agent_path, sp, config, idx, &stet_result) {
+                                                        Ok(o) => o,
+                                                        Err(e2) => {
+                                                            error!(task_index = idx, err = %e2, "address loop failed after retry");
+                                                            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                                error!(err = %save_err, "failed to save state after address failure");
+                                                            }
+                                                            return Err(e2);
+                                                        }
+                                                    }
+                                                } else if config.on_stet_fail == "skip" {
+                                                    warn!(task_index = idx, err = %e, "stet phase skipped");
+                                                    stet::AddressLoopOutcome {
+                                                        rounds_used: 0,
+                                                        findings_resolved: false,
+                                                        last_stet_result: stet_result.clone(),
+                                                    }
+                                                } else {
+                                                    error!(task_index = idx, err = %e, "address loop failed");
+                                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                        error!(err = %save_err, "failed to save state after address failure");
+                                                    }
+                                                    return Err(e);
                                                 }
-                                                e
-                                            })?;
+                                            }
+                                        };
 
                                         info!(
                                             task_index = idx,
@@ -537,14 +643,14 @@ pub fn run_scheduled(
                                             resolved = outcome.findings_resolved,
                                             "phase 3 complete"
                                         );
-                                        Ok(Some(outcome))
+                                        Ok(Some(Some(outcome)))
                                     } else {
                                         info!(task_index = idx, "phase 3: no findings, skipping address loop");
-                                        Ok(Some(stet::AddressLoopOutcome {
+                                        Ok(Some(Some(stet::AddressLoopOutcome {
                                             rounds_used: 0,
                                             findings_resolved: true,
                                             last_stet_result: stet_result,
-                                        }))
+                                        })))
                                     }
                                 } else {
                                     Ok(None)
@@ -673,6 +779,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -684,6 +791,7 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
         }
     }
 
@@ -771,6 +879,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -782,6 +891,7 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -938,6 +1048,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -949,6 +1060,7 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1117,6 +1229,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: state_dir.clone(),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1128,6 +1241,7 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
         };
 
         let mut state = fresh_state();
@@ -1686,6 +1800,9 @@ mod tests {
             "all four tasks should be completed after run"
         );
     }
+
+    #[test]
+    fn scheduled_single_parallel_demoted() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let echo = resolve_echo();
@@ -1753,6 +1870,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: state_dir.clone(),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1764,6 +1882,7 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
         };
 
         let mut state = fresh_state();

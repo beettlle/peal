@@ -30,7 +30,8 @@ pub struct PhaseOutput {
 ///
 /// Builds the prompt via `prompt::phase1`, constructs the `agent` argv,
 /// invokes the subprocess, and returns the captured stdout as the plan
-/// text.  On timeout or non-zero exit, returns an error.
+/// text.  On timeout or non-zero exit, retries up to `config.phase_retry_count`
+/// times before returning an error.
 pub fn run_phase1(
     agent_path: &Path,
     config: &PealConfig,
@@ -40,30 +41,52 @@ pub fn run_phase1(
     let prompt = prompt::phase1(task_content);
     let args = phase1_argv(config, &prompt);
     let timeout = Duration::from_secs(config.phase_timeout_sec);
-
     let agent_str = agent_path.to_string_lossy();
+    let max_attempts = 1 + config.phase_retry_count;
 
-    info!(
-        phase = 1,
-        task_index,
-        agent = %agent_str,
-        timeout_sec = config.phase_timeout_sec,
-        "invoking phase 1"
-    );
-    debug!(phase = 1, task_index, ?args, "phase 1 argv");
+    for attempt in 1..=max_attempts {
+        info!(
+            phase = 1,
+            task_index,
+            agent = %agent_str,
+            timeout_sec = config.phase_timeout_sec,
+            attempt,
+            max_attempts,
+            "invoking phase 1"
+        );
+        debug!(phase = 1, task_index, ?args, "phase 1 argv");
 
-    let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
-        .map_err(|e| PealError::PhaseSpawnFailed {
-            phase: 1,
-            detail: e.to_string(),
-        })?;
+        let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
+            .map_err(|e| PealError::PhaseSpawnFailed {
+                phase: 1,
+                detail: e.to_string(),
+            })?;
 
-    check_result(1, task_index, config.phase_timeout_sec, &result)?;
+        match check_result(1, task_index, config.phase_timeout_sec, &result) {
+            Ok(()) => {
+                return Ok(PhaseOutput {
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                });
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    warn!(
+                        phase = 1,
+                        task_index,
+                        attempt,
+                        max_attempts,
+                        err = %e,
+                        "phase 1 failed, retrying"
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
 
-    Ok(PhaseOutput {
-        stdout: result.stdout,
-        stderr: result.stderr,
-    })
+    unreachable!("retry loop returns or errs")
 }
 
 /// Build the argv (excluding the program name) for a Phase 1 invocation.
@@ -95,7 +118,8 @@ fn phase1_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
 ///
 /// Builds the prompt via `prompt::phase2`, constructs the `agent` argv
 /// (no `--plan` flag, includes `--sandbox`), invokes the subprocess, and
-/// returns the captured output.  On timeout or non-zero exit, returns an error.
+/// returns the captured output.  On timeout or non-zero exit, retries up to
+/// `config.phase_retry_count` times before returning an error.
 pub fn run_phase2(
     agent_path: &Path,
     config: &PealConfig,
@@ -105,30 +129,52 @@ pub fn run_phase2(
     let prompt = prompt::phase2(plan_text);
     let args = phase2_argv(config, &prompt);
     let timeout = Duration::from_secs(config.phase_timeout_sec);
-
     let agent_str = agent_path.to_string_lossy();
+    let max_attempts = 1 + config.phase_retry_count;
 
-    info!(
-        phase = 2,
-        task_index,
-        agent = %agent_str,
-        timeout_sec = config.phase_timeout_sec,
-        "invoking phase 2"
-    );
-    debug!(phase = 2, task_index, ?args, "phase 2 argv");
+    for attempt in 1..=max_attempts {
+        info!(
+            phase = 2,
+            task_index,
+            agent = %agent_str,
+            timeout_sec = config.phase_timeout_sec,
+            attempt,
+            max_attempts,
+            "invoking phase 2"
+        );
+        debug!(phase = 2, task_index, ?args, "phase 2 argv");
 
-    let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
-        .map_err(|e| PealError::PhaseSpawnFailed {
-            phase: 2,
-            detail: e.to_string(),
-        })?;
+        let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
+            .map_err(|e| PealError::PhaseSpawnFailed {
+                phase: 2,
+                detail: e.to_string(),
+            })?;
 
-    check_result(2, task_index, config.phase_timeout_sec, &result)?;
+        match check_result(2, task_index, config.phase_timeout_sec, &result) {
+            Ok(()) => {
+                return Ok(PhaseOutput {
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                });
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    warn!(
+                        phase = 2,
+                        task_index,
+                        attempt,
+                        max_attempts,
+                        err = %e,
+                        "phase 2 failed, retrying"
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
 
-    Ok(PhaseOutput {
-        stdout: result.stdout,
-        stderr: result.stderr,
-    })
+    unreachable!("retry loop returns or errs")
 }
 
 /// Build the argv (excluding the program name) for a Phase 2 invocation.
@@ -317,8 +363,10 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 1800,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
+            continue_with_remaining_tasks: false,
             log_level: None,
             log_file: None,
             stet_path: None,
@@ -327,6 +375,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         }
     }
 
@@ -533,6 +584,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -543,6 +595,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -590,6 +645,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -600,6 +656,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -636,6 +695,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let sleep_path = crate::cursor::resolve_agent_cmd("sleep").expect("sleep must exist");
@@ -670,6 +732,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -680,6 +743,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -710,6 +776,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -720,6 +787,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -762,6 +832,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -772,6 +843,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -797,6 +871,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -807,6 +882,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -903,6 +981,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -913,6 +992,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -957,6 +1039,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -967,6 +1050,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -992,6 +1078,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -1002,6 +1089,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -1030,6 +1120,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -1040,6 +1131,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -1084,6 +1178,7 @@ mod tests {
             on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
+            phase_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             log_level: None,
@@ -1094,6 +1189,9 @@ mod tests {
             stet_run_extra_args: vec![],
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
