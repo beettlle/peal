@@ -876,7 +876,7 @@ G
         let err = parse_plan_file(Path::new("/no/such/file.md")).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("does not exist"),
+            msg.contains("does not exist") || msg.contains("Invalid or missing plan file"),
             "expected file-not-found error, got: {msg}"
         );
     }

@@ -3,12 +3,25 @@
 //! Phase 3 uses stet for review and address. Peal invokes `stet run` with `--output=json`
 //! so findings are machine-readable; it requires a stet binary that supports `--output=json`.
 //! If stet is not found on PATH (or via `stet_path`), Phase 3 is skipped.
+//!
+//! ## Supported stet run JSON output shapes
+//!
+//! Peal treats the following as machine-readable findings output (for detection and parsing):
+//! - `{"findings": [...]}` — canonical stet format; each item has `id`, `file`, `line`, `severity`,
+//!   `category`, `confidence`, `message`, optional `suggestion`, etc. (stet `docs/cli-extension-contract.md`,
+//!   `cli/internal/findings/finding.go`; emitted by `writeFindingsJSON` in stet `main.go`).
+//! - `{"count": N}` with N > 0 — backward compatibility.
+//! - Top-level array `[...]` — backward compatibility.
+//! - Object with alternate key for findings list (e.g. `"issues"`) — non-empty array treated as findings present.
+//!
+//! Peal uses `stet run --output=json` without `--stream`, so stdout is a single JSON object (or array).
+//! Streaming NDJSON is not used.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{PealConfig, StetDismissPattern, STET_DISMISS_REASONS};
 use crate::cursor::is_executable;
@@ -17,6 +30,26 @@ use crate::phase::{self, PhaseOutput};
 use crate::subprocess;
 
 const STET_BINARY: &str = "stet";
+
+/// Keys (in order) used to locate the findings array in a JSON object. Canonical stet key first.
+const FINDINGS_ARRAY_KEYS: &[&str] = &["findings", "issues"];
+
+/// Returns a reference to the findings array from parsed stet run JSON.
+/// Supports object with "findings" or "issues" key, or top-level array. Single place for format logic.
+fn findings_array_from_value(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in FINDINGS_ARRAY_KEYS {
+                if let Some(arr) = map.get(*key).and_then(|v| v.as_array()) {
+                    return Some(arr);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => Some(arr),
+        _ => None,
+    }
+}
 
 /// Resolve the `stet` binary to an absolute path.
 ///
@@ -238,6 +271,15 @@ pub fn run_review(
 
     let has_findings = detect_findings(result.exit_code, &result.stdout);
 
+    if !has_findings && !result.stdout.is_empty() {
+        let snippet_len = result.stdout.len().min(400);
+        let snippet = &result.stdout[..snippet_len];
+        debug!(
+            stet_stdout_snippet = %snippet,
+            "stet run completed with no findings; snippet of stdout for format debugging"
+        );
+    }
+
     info!(
         exit_code = ?result.exit_code,
         has_findings,
@@ -256,9 +298,11 @@ pub fn run_review(
 
 /// Determine whether `stet run` output indicates findings, applied in priority order:
 ///
-/// 1. **JSON (machine-readable):** If stdout parses as a JSON object with a
-///    `"findings"` key containing a non-empty array, or a `"count"` key > 0 →
-///    findings present. A top-level JSON array with items also means findings.
+/// 1. **JSON (machine-readable):** If stdout parses as JSON:
+///    - Object with non-empty `"findings"` array → findings present.
+///    - Object with `"count"` > 0 → findings present.
+///    - Object with other known key (e.g. `"issues"`) containing non-empty array → findings present.
+///    - Top-level non-empty array → findings present.
 /// 2. **Human summary (stet default):** If stdout is not JSON and the last line
 ///    indicates zero findings (e.g. "0 finding(s)." or "0 finding(s) at X tokens/sec.") →
 ///    no findings.
@@ -267,23 +311,17 @@ pub fn run_review(
 ///    non-whitespace content → findings present.
 pub fn detect_findings(exit_code: Option<i32>, stdout: &str) -> bool {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) {
-        return match &value {
-            serde_json::Value::Object(map) => {
-                if let Some(findings) = map.get("findings") {
-                    if let Some(arr) = findings.as_array() {
-                        return !arr.is_empty();
-                    }
+        if let Some(arr) = findings_array_from_value(&value) {
+            return !arr.is_empty();
+        }
+        if let serde_json::Value::Object(map) = &value {
+            if let Some(count) = map.get("count") {
+                if let Some(n) = count.as_u64() {
+                    return n > 0;
                 }
-                if let Some(count) = map.get("count") {
-                    if let Some(n) = count.as_u64() {
-                        return n > 0;
-                    }
-                }
-                false
             }
-            serde_json::Value::Array(arr) => !arr.is_empty(),
-            _ => false,
-        };
+        }
+        return false;
     }
 
     // Human-output fallback: stet's writeFindingsHuman prints "0 finding(s)." or "0 finding(s) at X tokens/sec."
@@ -318,14 +356,11 @@ pub struct ParsedFinding {
 }
 
 /// Parse stet run JSON stdout into a list of findings with id, message, suggestion, path.
-/// Supports `{"findings": [...]}` or top-level array. Returns None if not JSON or no findings array.
+/// Uses the same format resolution as [`findings_array_from_value`] (findings, issues, or top-level array).
+/// Returns None if not JSON or no findings array.
 pub fn parse_findings_from_run_json(stdout: &str) -> Option<Vec<ParsedFinding>> {
     let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
-    let items = match &value {
-        serde_json::Value::Object(map) => map.get("findings")?.as_array()?,
-        serde_json::Value::Array(arr) => arr,
-        _ => return None,
-    };
+    let items = findings_array_from_value(&value)?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let obj = item.as_object()?;
@@ -556,19 +591,11 @@ fn normalize_dismiss_reason(s: &str) -> String {
 
 /// Extract `suggestion` fields from stet JSON output.
 ///
-/// Supports two shapes:
-/// - `{"findings": [{"suggestion": "..."}, ...]}` (object with findings array)
-/// - `[{"suggestion": "..."}, ...]` (top-level array)
-///
+/// Uses the same format resolution as [`findings_array_from_value`] (findings, issues, or top-level array).
 /// Returns `None` when the output is not JSON or no finding has a `suggestion` field.
 pub fn extract_suggestions(stdout: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
-
-    let items: &Vec<serde_json::Value> = match &value {
-        serde_json::Value::Object(map) => map.get("findings")?.as_array()?,
-        serde_json::Value::Array(arr) => arr,
-        _ => return None,
-    };
+    let items = findings_array_from_value(&value)?;
 
     let suggestions: Vec<&str> = items
         .iter()
@@ -711,12 +738,10 @@ pub fn address_loop(
 
 /// Best-effort count of findings from stet stdout. Falls back to 1 when
 /// the output is not structured JSON with a countable findings array.
+/// Uses the same format resolution as [`findings_array_from_value`].
 fn count_findings(stdout: &str) -> usize {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) {
-        if let Some(arr) = value.get("findings").and_then(|v| v.as_array()) {
-            return arr.len();
-        }
-        if let Some(arr) = value.as_array() {
+        if let Some(arr) = findings_array_from_value(&value) {
             return arr.len();
         }
     }
@@ -1097,6 +1122,30 @@ mod tests {
         assert!(!detect_findings(Some(0), stdout));
     }
 
+    #[test]
+    fn detect_findings_stet_no_findings_exact() {
+        let stdout = r#"{"findings":[]}"#;
+        assert!(!detect_findings(Some(0), stdout));
+    }
+
+    #[test]
+    fn detect_findings_stet_with_findings_exact() {
+        let stdout = r#"{"findings":[{"id":"abc123","file":"src/lib.rs","line":10,"severity":"warning","category":"maintainability","confidence":0.9,"message":"Consider adding a comment","suggestion":"Add a doc comment"}]}"#;
+        assert!(detect_findings(Some(0), stdout));
+    }
+
+    #[test]
+    fn detect_findings_json_object_issues_nonempty() {
+        let stdout = r#"{"issues":[{"id":"x","message":"y"}]}"#;
+        assert!(detect_findings(Some(0), stdout));
+    }
+
+    #[test]
+    fn detect_findings_json_object_issues_empty_no_findings() {
+        let stdout = r#"{"issues":[]}"#;
+        assert!(!detect_findings(Some(0), stdout));
+    }
+
     // -- parse_findings_from_run_json tests --
 
     #[test]
@@ -1143,6 +1192,27 @@ mod tests {
         let stdout = r#"{"findings": [{"id": "x", "message": "m", "path": "src/lib.rs"}]}"#;
         let out = parse_findings_from_run_json(stdout).unwrap();
         assert_eq!(out[0].path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn parse_findings_from_run_json_stet_shaped_full_finding() {
+        let stdout = r#"{"findings":[{"id":"f1","file":"cli/main.go","line":42,"severity":"info","category":"maintainability","confidence":0.9,"message":"Consider adding a comment","suggestion":"Add doc comment"}]}"#;
+        let out = parse_findings_from_run_json(stdout).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "f1");
+        assert_eq!(out[0].message, "Consider adding a comment");
+        assert_eq!(out[0].path.as_deref(), Some("cli/main.go"));
+        assert_eq!(out[0].suggestion.as_deref(), Some("Add doc comment"));
+    }
+
+    #[test]
+    fn parse_findings_from_run_json_issues_array_same_shape() {
+        let stdout = r#"{"issues":[{"id":"i1","file":"pkg/foo.go","message":"Unused variable"}]}"#;
+        let out = parse_findings_from_run_json(stdout).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "i1");
+        assert_eq!(out[0].message, "Unused variable");
+        assert_eq!(out[0].path.as_deref(), Some("pkg/foo.go"));
     }
 
     // -- parse_triage_response tests --
@@ -1362,6 +1432,12 @@ exit 0
                 pattern: "unused".to_string(),
                 reason: "false_positive".to_string(),
             }],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
         let run_stdout = r#"{"findings":[{"id":"f1","message":"unused variable"}]}"#;
         let result = dismiss_non_actionable_and_rerun(&stet_path, &agent_path, &config, run_stdout).unwrap();
@@ -1509,6 +1585,20 @@ exit 0
     fn extract_suggestions_none_for_scalar_json() {
         assert_eq!(extract_suggestions("true"), None);
         assert_eq!(extract_suggestions("42"), None);
+    }
+
+    #[test]
+    fn extract_suggestions_stet_shaped() {
+        let stdout = r#"{"findings":[{"id":"f1","file":"a.go","line":1,"severity":"info","category":"maintainability","confidence":0.9,"message":"Add comment","suggestion":"Add doc comment here"}]}"#;
+        let result = extract_suggestions(stdout);
+        assert_eq!(result, Some("Add doc comment here".to_owned()));
+    }
+
+    #[test]
+    fn extract_suggestions_from_issues_array() {
+        let stdout = r#"{"issues":[{"id":"i1","message":"m","suggestion":"fix via X"}]}"#;
+        let result = extract_suggestions(stdout);
+        assert_eq!(result, Some("fix via X".to_owned()));
     }
 
     // -- address_findings integration test --
@@ -1664,6 +1754,18 @@ exit 0
     #[test]
     fn count_findings_empty_array_returns_zero() {
         assert_eq!(count_findings("[]"), 0);
+    }
+
+    #[test]
+    fn count_findings_issues_array() {
+        let stdout = r#"{"issues":[{"id":"a","message":"m1"},{"id":"b","message":"m2"}]}"#;
+        assert_eq!(count_findings(stdout), 2);
+    }
+
+    #[test]
+    fn count_findings_stet_shaped() {
+        let stdout = r#"{"findings":[{"id":"f1","file":"a.go","line":1,"severity":"warning","category":"style","confidence":1.0,"message":"msg"}]}"#;
+        assert_eq!(count_findings(stdout), 1);
     }
 
     // -- address_loop tests --

@@ -267,10 +267,10 @@ mod tests {
             "p.md",
             "--repo",
             "/r",
-            "--normalize-retries",
+            "--normalize-retry-count",
             "2",
         ])
-        .expect("should parse --normalize-retries");
+        .expect("should parse --normalize-retry-count");
 
         match cli.command {
             Commands::Run(args) => assert_eq!(args.normalize_retry_count, Some(2)),

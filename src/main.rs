@@ -2,6 +2,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 #[cfg(unix)]
+#[allow(unused_imports)]
 use std::os::unix::fs::PermissionsExt;
 
 use clap::Parser;
@@ -281,12 +282,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         None => {}
                         Some(Ok(result)) => {
                             const TRUNCATE_BYTES: usize = 2048;
-                            let truncate = |s: &str, max: usize| {
+                            let truncate = |s: &str, max: usize| -> String {
                                 if s.len() <= max {
-                                    s
+                                    s.to_string()
                                 } else {
                                     let end = s.floor_char_boundary(max);
-                                    &s[..end]
+                                    s[..end].to_string()
                                 }
                             };
                             if result.success() {
@@ -566,7 +567,7 @@ mod tests {
             "--agent-cmd",
             stub.to_str().unwrap(),
             "--normalize",
-            "--normalize-retries",
+            "--normalize-retry-count",
             "0",
             "--stet-path",
             "/nonexistent",
@@ -585,7 +586,7 @@ mod tests {
         );
     }
 
-    /// Stub returns bad output on first call, canonical on second; normalize_retry_count=1 -> success after two invocations.
+    /// Stub returns bad output on first call, canonical on second; normalize_retry_count=1 -> success after two normalization attempts. Agent is invoked 4 times total: 2 for normalize (retry once) and 2 for phase 1 + phase 2.
     #[test]
     #[cfg(unix)]
     fn run_normalize_retry_succeeds_on_second_attempt() {
@@ -626,7 +627,7 @@ printf '%s\n' '## Task 1' 'Do it.'
             "--agent-cmd",
             stub.to_str().unwrap(),
             "--normalize",
-            "--normalize-retries",
+            "--normalize-retry-count",
             "1",
             "--stet-path",
             "/nonexistent",
@@ -640,7 +641,8 @@ printf '%s\n' '## Task 1' 'Do it.'
             .trim()
             .parse()
             .unwrap_or(0);
-        assert_eq!(count, 2, "normalization should have been invoked twice");
+        // Two normalization attempts (first fails parse, second succeeds) plus phase 1 + phase 2 = 4 agent invocations.
+        assert_eq!(count, 4, "expected 4 agent invocations (2 normalize + phase1 + phase2), got {count}");
     }
 
     #[test]

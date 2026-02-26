@@ -589,7 +589,7 @@ pub fn run_scheduled(
                                         &config.stet_run_extra_args,
                                         timeout,
                                         config.on_stet_fail.as_str(),
-                                        idx,
+                                        *idx,
                                         peal_state,
                                         state_dir,
                                     )?;
@@ -605,12 +605,12 @@ pub fn run_scheduled(
                                     if stet_result.has_findings {
                                         info!(task_index = idx, "phase 3: findings detected, starting address loop");
 
-                                        let outcome = match stet::address_loop(agent_path, sp, config, idx, &stet_result) {
+                                        let outcome = match stet::address_loop(agent_path, sp, config, *idx, &stet_result) {
                                             Ok(o) => o,
                                             Err(e) => {
                                                 if config.on_stet_fail == "retry_once" {
                                                     warn!(task_index = idx, err = %e, "address loop failed, retrying once");
-                                                    match stet::address_loop(agent_path, sp, config, idx, &stet_result) {
+                                                    match stet::address_loop(agent_path, sp, config, *idx, &stet_result) {
                                                         Ok(o) => o,
                                                         Err(e2) => {
                                                             error!(task_index = idx, err = %e2, "address loop failed after retry");
@@ -643,14 +643,14 @@ pub fn run_scheduled(
                                             resolved = outcome.findings_resolved,
                                             "phase 3 complete"
                                         );
-                                        Ok(Some(Some(outcome)))
+                                        Ok(Some(outcome))
                                     } else {
                                         info!(task_index = idx, "phase 3: no findings, skipping address loop");
-                                        Ok(Some(Some(stet::AddressLoopOutcome {
+                                        Ok(Some(stet::AddressLoopOutcome {
                                             rounds_used: 0,
                                             findings_resolved: true,
                                             last_stet_result: stet_result,
-                                        })))
+                                        }))
                                     }
                                 } else {
                                     Ok(None)
@@ -660,7 +660,7 @@ pub fn run_scheduled(
                         match phase3_result {
                             Ok(phase3_outcome) => {
                                 results.push(TaskResult {
-                                    task_index: idx,
+                                    task_index: *idx,
                                     plan_text,
                                     phase2_stdout,
                                     phase3_outcome,

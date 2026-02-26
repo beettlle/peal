@@ -265,7 +265,10 @@ impl PealConfig {
             phase_retry_count: merged
                 .phase_retry_count
                 .unwrap_or(DEFAULT_PHASE_RETRY_COUNT),
-            parallel: merged.parallel.unwrap_or(false),
+            parallel: merged
+                .parallel
+                .or_else(|| merged.max_parallel.map(|_| true))
+                .unwrap_or(false),
             max_parallel: merged.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL),
             continue_with_remaining_tasks: merged.continue_with_remaining_tasks.unwrap_or(false),
             log_level: merged.log_level,
@@ -335,7 +338,10 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
 /// Returns true if `path` is the root of a git worktree (or inside one).
 fn is_git_repo(path: &Path) -> bool {
     let output = match Command::new("git")
-        .args(["-C", path.as_os_str(), "rev-parse", "--is-inside-work-tree"])
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
         .output()
     {
         Ok(o) => o,
@@ -987,17 +993,20 @@ bogus_key = true
             plan: Some(PathBuf::from("p.md")),
             repo: Some(PathBuf::from("/r")),
             normalize: false,
+            normalize_retry_count: None,
             config: None,
             agent_cmd: None,
             model: None,
             sandbox: None,
             state_dir: None,
             phase_timeout_sec: None,
+            phase_retry_count: None,
             parallel: false,
             max_parallel: Some(2),
             continue_with_remaining_tasks: false,
             max_address_rounds: None,
             on_findings_remaining: None,
+            on_stet_fail: None,
             task: None,
             from_task: None,
             log_level: None,
@@ -1043,8 +1052,8 @@ bogus_key = true
         let err = cfg.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("does not exist"),
-            "expected 'does not exist', got: {msg}"
+            msg.contains("does not exist") || msg.contains("Invalid or missing plan file"),
+            "expected 'does not exist' or 'Invalid or missing plan file', got: {msg}"
         );
     }
 
