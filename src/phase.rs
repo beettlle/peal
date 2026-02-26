@@ -160,17 +160,18 @@ fn phase2_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
 
 /// Run Phase 3 (address stet findings) for a single task.
 ///
-/// Builds the prompt via `prompt::phase3`, constructs the `agent` argv
-/// (same layout as Phase 2: no `--plan`, with `--sandbox`), invokes the
-/// subprocess, and returns the captured output.  On timeout or non-zero
-/// exit, returns an error.
+/// Builds the prompt via `prompt::phase3_with_suggestions`, constructs the
+/// `agent` argv (same layout as Phase 2: no `--plan`, with `--sandbox`),
+/// invokes the subprocess, and returns the captured output.  On timeout or
+/// non-zero exit, returns an error.
 pub fn run_phase3(
     agent_path: &Path,
     config: &PealConfig,
     task_index: u32,
     stet_output: &str,
+    suggestions: Option<&str>,
 ) -> Result<PhaseOutput, PealError> {
-    let prompt = prompt::phase3(stet_output);
+    let prompt = prompt::phase3_with_suggestions(stet_output, suggestions);
     let args = phase3_argv(config, &prompt);
     let timeout = Duration::from_secs(config.phase_timeout_sec);
 
@@ -263,12 +264,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: model.map(|s| s.to_owned()),
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 1800,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         }
     }
 
@@ -468,12 +472,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -518,12 +525,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -546,6 +556,7 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             // Very short timeout to trigger kill.
             phase_timeout_sec: 1,
@@ -553,6 +564,8 @@ mod tests {
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let sleep_path = crate::cursor::resolve_agent_cmd("sleep").expect("sleep must exist");
@@ -584,12 +597,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -617,12 +633,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -662,12 +681,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -690,12 +712,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -787,12 +812,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -802,7 +830,7 @@ mod tests {
             crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
         };
 
-        let output = run_phase3(&actual_echo, &config, 1, "warning: unused variable `x`").unwrap();
+        let output = run_phase3(&actual_echo, &config, 1, "warning: unused variable `x`", None).unwrap();
 
         assert!(
             output
@@ -834,16 +862,19 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
-        let err = run_phase3(&false_path, &config, 1, "stet output").unwrap_err();
+        let err = run_phase3(&false_path, &config, 1, "stet output", None).unwrap_err();
 
         match err {
             PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 3),
@@ -862,16 +893,19 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
-        let err = run_phase3(&bad_path, &config, 1, "stet output").unwrap_err();
+        let err = run_phase3(&bad_path, &config, 1, "stet output", None).unwrap_err();
 
         match err {
             PealError::PhaseSpawnFailed { phase, detail } => {
@@ -880,5 +914,98 @@ mod tests {
             }
             other => panic!("expected PhaseSpawnFailed for phase 3, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_phase3_with_suggestions_echo_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "echo".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
+        };
+
+        let echo_path = PathBuf::from("/bin/echo");
+        let actual_echo = if echo_path.exists() {
+            echo_path
+        } else {
+            crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
+        };
+
+        let output = run_phase3(
+            &actual_echo,
+            &config,
+            1,
+            "finding: bad code",
+            Some("Use good code instead"),
+        )
+        .unwrap();
+
+        assert!(
+            output.stdout.contains("---SUGGESTIONS---"),
+            "stdout should contain SUGGESTIONS delimiter: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Use good code instead"),
+            "stdout should contain the suggestion text: {:?}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn run_phase3_without_suggestions_echo_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PealConfig {
+            agent_cmd: "echo".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
+        };
+
+        let echo_path = PathBuf::from("/bin/echo");
+        let actual_echo = if echo_path.exists() {
+            echo_path
+        } else {
+            crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
+        };
+
+        let output = run_phase3(&actual_echo, &config, 1, "finding: bad code", None).unwrap();
+
+        assert!(
+            !output.stdout.contains("---SUGGESTIONS---"),
+            "stdout should NOT contain SUGGESTIONS delimiter when None: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("---STET---"),
+            "stdout should still contain STET delimiter: {:?}",
+            output.stdout
+        );
     }
 }

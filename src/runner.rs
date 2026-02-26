@@ -4,7 +4,7 @@
 //! SP-2.2: sequential runner — Phase 1 → Phase 2 per task, fail-fast.
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{error, info};
 
@@ -13,6 +13,7 @@ use crate::error::PealError;
 use crate::phase::{self, PhaseOutput};
 use crate::plan::ParsedPlan;
 use crate::state::{self, PealState};
+use crate::stet;
 
 /// The result of running Phase 1 for a single task.
 #[derive(Debug, Clone)]
@@ -27,6 +28,7 @@ pub struct TaskResult {
     pub task_index: u32,
     pub plan_text: String,
     pub phase2_stdout: String,
+    pub phase3_outcome: Option<stet::AddressLoopOutcome>,
 }
 
 /// Run Phase 1 (plan creation) for every task in order.
@@ -40,9 +42,11 @@ pub fn run_phase1_all(
     plan: &ParsedPlan,
     peal_state: &mut PealState,
     state_dir: &Path,
+    stet_path: Option<&Path>,
 ) -> Result<Vec<TaskPhase1Result>, PealError> {
     let task_count = plan.tasks.len();
-    info!(task_count, "starting phase 1 for all tasks");
+    let phase3_available = stet_path.is_some();
+    info!(task_count, phase3_available, "starting phase 1 for all tasks");
 
     let mut results: Vec<TaskPhase1Result> = Vec::with_capacity(task_count);
 
@@ -122,9 +126,11 @@ pub fn run_all(
     plan: &ParsedPlan,
     peal_state: &mut PealState,
     state_dir: &Path,
+    stet_path: Option<&Path>,
 ) -> Result<Vec<TaskResult>, PealError> {
     let task_count = plan.tasks.len();
-    info!(task_count, "starting sequential run (phase 1 → phase 2)");
+    let phase3_available = stet_path.is_some();
+    info!(task_count, phase3_available, "starting sequential run (phase 1 → phase 2)");
 
     let mut results: Vec<TaskResult> = Vec::with_capacity(task_count);
 
@@ -207,6 +213,56 @@ pub fn run_all(
             "phase 2 complete"
         );
 
+        // -- Phase 3 (stet review + address) --
+        let phase3_outcome = if let Some(sp) = stet_path {
+            let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+
+            info!(
+                task_index = task.index,
+                position, task_count,
+                "phase 3: running stet review"
+            );
+
+            let stet_result = stet::run_review(sp, &config.repo_path, timeout)
+                .map_err(|e| {
+                    error!(task_index = task.index, err = %e, "stet run failed");
+                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                        error!(err = %save_err, "failed to save state after stet failure");
+                    }
+                    e
+                })?;
+
+            if stet_result.has_findings {
+                info!(task_index = task.index, "phase 3: findings detected, starting address loop");
+
+                let outcome = stet::address_loop(agent_path, sp, config, task.index, &stet_result)
+                    .map_err(|e| {
+                        error!(task_index = task.index, err = %e, "address loop failed");
+                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                            error!(err = %save_err, "failed to save state after address failure");
+                        }
+                        e
+                    })?;
+
+                info!(
+                    task_index = task.index,
+                    rounds = outcome.rounds_used,
+                    resolved = outcome.findings_resolved,
+                    "phase 3 complete"
+                );
+                Some(outcome)
+            } else {
+                info!(task_index = task.index, "phase 3: no findings, skipping address loop");
+                Some(stet::AddressLoopOutcome {
+                    rounds_used: 0,
+                    findings_resolved: true,
+                    last_stet_result: stet_result,
+                })
+            }
+        } else {
+            None
+        };
+
         peal_state.mark_task_completed(task.index);
         state::save_state(peal_state, state_dir)?;
 
@@ -214,6 +270,7 @@ pub fn run_all(
             task_index: task.index,
             plan_text: p1_output.stdout,
             phase2_stdout: p2_output.stdout,
+            phase3_outcome,
         });
     }
 
@@ -241,12 +298,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         }
     }
 
@@ -289,7 +349,7 @@ mod tests {
             },
         ]);
 
-        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].task_index, 1);
@@ -315,7 +375,7 @@ mod tests {
         let mut state = fresh_state();
 
         let plan = make_plan(vec![]);
-        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert!(results.is_empty());
     }
@@ -331,12 +391,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -356,7 +419,7 @@ mod tests {
             },
         ]);
 
-        let err = run_phase1_all(&false_path, &config, &plan, &mut state, &state_dir).unwrap_err();
+        let err = run_phase1_all(&false_path, &config, &plan, &mut state, &state_dir, None).unwrap_err();
 
         match err {
             PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 1),
@@ -378,7 +441,7 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_index, 42);
@@ -411,7 +474,7 @@ mod tests {
             },
         ]);
 
-        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![10, 20, 30]);
@@ -440,7 +503,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].task_index, 1);
@@ -457,6 +520,11 @@ mod tests {
                 "phase2_stdout should be non-empty for task {}",
                 r.task_index
             );
+            assert!(
+                r.phase3_outcome.is_none(),
+                "phase3_outcome should be None when stet_path is None for task {}",
+                r.task_index
+            );
         }
     }
 
@@ -469,7 +537,7 @@ mod tests {
         let mut state = fresh_state();
 
         let plan = make_plan(vec![]);
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert!(results.is_empty());
     }
@@ -485,12 +553,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -510,7 +581,7 @@ mod tests {
             },
         ]);
 
-        let err = run_all(&false_path, &config, &plan, &mut state, &state_dir).unwrap_err();
+        let err = run_all(&false_path, &config, &plan, &mut state, &state_dir, None).unwrap_err();
 
         match err {
             PealError::PhaseNonZeroExit { phase, .. } => assert_eq!(phase, 1),
@@ -532,7 +603,7 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_index, 7);
@@ -542,6 +613,7 @@ mod tests {
                 .phase2_stdout
                 .contains("Execute the following plan")
         );
+        assert!(results[0].phase3_outcome.is_none());
     }
 
     #[test]
@@ -570,7 +642,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![10, 20, 30]);
@@ -590,13 +662,14 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert!(
             results[0].phase2_stdout.contains("---PLAN---"),
             "phase 2 output should contain plan delimiters: {:?}",
             results[0].phase2_stdout
         );
+        assert!(results[0].phase3_outcome.is_none());
     }
 
     // -- State persistence integration tests --
@@ -627,7 +700,7 @@ mod tests {
             },
         ]);
 
-        run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         let loaded = state::load_state(&state_dir)
             .unwrap()
@@ -654,12 +727,15 @@ mod tests {
             sandbox: "disabled".to_owned(),
             model: None,
             max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
             state_dir: state_dir.clone(),
             phase_timeout_sec: 30,
             parallel: false,
             max_parallel: 4,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
 
         let mut state = fresh_state();
@@ -676,7 +752,7 @@ mod tests {
             },
         ]);
 
-        let _ = run_all(&false_path, &config, &plan, &mut state, &state_dir);
+        let _ = run_all(&false_path, &config, &plan, &mut state, &state_dir, None);
 
         let loaded = state::load_state(&state_dir)
             .unwrap()
@@ -702,7 +778,7 @@ mod tests {
         ]);
 
         let mut state2 = fresh_state();
-        run_all(&echo, &good_config, &plan2, &mut state2, &state_dir).unwrap();
+        run_all(&echo, &good_config, &plan2, &mut state2, &state_dir, None).unwrap();
 
         let loaded2 = state::load_state(&state_dir)
             .unwrap()
@@ -726,7 +802,7 @@ mod tests {
             parallel: false,
         }]);
 
-        run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert!(state_dir.join("state.json").exists());
     }
@@ -761,7 +837,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![2, 3], "task 1 should be skipped");
@@ -796,7 +872,7 @@ mod tests {
             },
         ]);
 
-        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_phase1_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![3], "tasks 1 and 2 should be skipped");
@@ -826,7 +902,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         assert!(
             results.is_empty(),
@@ -870,7 +946,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![3, 4], "should resume from task 3");
@@ -880,5 +956,162 @@ mod tests {
             .unwrap()
             .expect("state file should exist");
         assert_eq!(loaded.completed_task_indices, vec![1, 2, 3, 4]);
+    }
+
+    // -- Phase 3 integration tests (SP-4.6) --
+
+    #[test]
+    fn run_all_skips_phase3_when_stet_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task {
+                index: 1,
+                content: "A.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "B.".to_owned(),
+                parallel: false,
+            },
+        ]);
+
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(
+                r.phase3_outcome.is_none(),
+                "phase3_outcome should be None when stet_path is None for task {}",
+                r.task_index
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_all_runs_phase3_no_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        // `true` exits 0 with empty stdout → detect_findings returns false.
+        let stet = crate::cursor::resolve_agent_cmd("true").expect("true must exist");
+
+        let plan = make_plan(vec![Task {
+            index: 1,
+            content: "A.".to_owned(),
+            parallel: false,
+        }]);
+
+        let results =
+            run_all(&echo, &config, &plan, &mut state, &state_dir, Some(&stet)).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let outcome = results[0]
+            .phase3_outcome
+            .as_ref()
+            .expect("phase3_outcome should be Some when stet_path is provided");
+        assert!(outcome.findings_resolved);
+        assert_eq!(outcome.rounds_used, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_all_runs_phase3_with_findings_resolved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+        let config = test_config(dir.path());
+
+        // Stateful stet stub: returns findings on first call, clean on second.
+        let stet_script = dir.path().join("stet-stub");
+        std::fs::write(
+            &stet_script,
+            "#!/bin/sh\n\
+             STATE_FILE=\"$PWD/.stet_state\"\n\
+             if [ -f \"$STATE_FILE\" ]; then\n\
+             exit 0\n\
+             else\n\
+             touch \"$STATE_FILE\"\n\
+             echo '{\"findings\": [{\"id\": \"f1\", \"message\": \"test\"}]}'\n\
+             exit 1\n\
+             fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stet_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let plan = make_plan(vec![Task {
+            index: 1,
+            content: "A.".to_owned(),
+            parallel: false,
+        }]);
+
+        let results =
+            run_all(&echo, &config, &plan, &mut state, &state_dir, Some(&stet_script)).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let outcome = results[0]
+            .phase3_outcome
+            .as_ref()
+            .expect("phase3_outcome should be Some");
+        assert!(outcome.findings_resolved);
+        assert!(
+            outcome.rounds_used >= 1,
+            "should have used at least 1 address round, got {}",
+            outcome.rounds_used
+        );
+    }
+
+    #[test]
+    fn run_all_phase3_failure_saves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let echo = resolve_echo();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+        let config = test_config(dir.path());
+
+        let bad_stet = PathBuf::from("/no/such/stet-binary");
+
+        let plan = make_plan(vec![
+            Task {
+                index: 1,
+                content: "A.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "B.".to_owned(),
+                parallel: false,
+            },
+        ]);
+
+        let err =
+            run_all(&echo, &config, &plan, &mut state, &state_dir, Some(&bad_stet)).unwrap_err();
+
+        match err {
+            PealError::StetRunFailed { .. } => {}
+            other => panic!("expected StetRunFailed, got: {other:?}"),
+        }
+
+        // State saved before error propagated; task not marked complete because
+        // Phase 3 failed before mark_task_completed.
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state file should exist even on stet failure");
+        assert!(
+            loaded.completed_task_indices.is_empty(),
+            "no tasks should be completed since stet failed before marking"
+        );
     }
 }

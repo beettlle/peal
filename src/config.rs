@@ -11,6 +11,7 @@ use crate::cli::RunArgs;
 const DEFAULT_AGENT_CMD: &str = "agent";
 const DEFAULT_SANDBOX: &str = "disabled";
 const DEFAULT_MAX_ADDRESS_ROUNDS: u32 = 3;
+const DEFAULT_ON_FINDINGS_REMAINING: &str = "fail";
 const DEFAULT_STATE_DIR: &str = ".peal";
 const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 1800;
 const DEFAULT_MAX_PARALLEL: u32 = 4;
@@ -29,12 +30,15 @@ pub struct PealConfig {
     pub sandbox: String,
     pub model: Option<String>,
     pub max_address_rounds: u32,
+    pub on_findings_remaining: String,
     pub state_dir: PathBuf,
     pub phase_timeout_sec: u64,
     pub parallel: bool,
     pub max_parallel: u32,
     pub log_level: Option<String>,
     pub log_file: Option<PathBuf>,
+    pub stet_path: Option<PathBuf>,
+    pub stet_start_ref: Option<String>,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -48,12 +52,15 @@ struct FileConfig {
     sandbox: Option<String>,
     model: Option<String>,
     max_address_rounds: Option<u32>,
+    on_findings_remaining: Option<String>,
     state_dir: Option<PathBuf>,
     phase_timeout_sec: Option<u64>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
     log_level: Option<String>,
     log_file: Option<PathBuf>,
+    stet_path: Option<PathBuf>,
+    stet_start_ref: Option<String>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -66,12 +73,15 @@ struct ConfigLayer {
     sandbox: Option<String>,
     model: Option<String>,
     max_address_rounds: Option<u32>,
+    on_findings_remaining: Option<String>,
     state_dir: Option<PathBuf>,
     phase_timeout_sec: Option<u64>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
     log_level: Option<String>,
     log_file: Option<PathBuf>,
+    stet_path: Option<PathBuf>,
+    stet_start_ref: Option<String>,
 }
 
 impl PealConfig {
@@ -105,6 +115,11 @@ impl PealConfig {
         if !self.repo_path.is_dir() {
             return Err(crate::error::PealError::RepoNotDirectory {
                 path: self.repo_path.clone(),
+            });
+        }
+        if self.on_findings_remaining != "fail" && self.on_findings_remaining != "warn" {
+            return Err(crate::error::PealError::InvalidOnFindingsRemaining {
+                value: self.on_findings_remaining.clone(),
             });
         }
         Ok(())
@@ -145,6 +160,9 @@ impl PealConfig {
             max_address_rounds: merged
                 .max_address_rounds
                 .unwrap_or(DEFAULT_MAX_ADDRESS_ROUNDS),
+            on_findings_remaining: merged
+                .on_findings_remaining
+                .unwrap_or_else(|| DEFAULT_ON_FINDINGS_REMAINING.to_owned()),
             state_dir: merged
                 .state_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
@@ -155,6 +173,8 @@ impl PealConfig {
             max_parallel: merged.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL),
             log_level: merged.log_level,
             log_file: merged.log_file,
+            stet_path: merged.stet_path,
+            stet_start_ref: merged.stet_start_ref,
         })
     }
 }
@@ -172,12 +192,15 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         sandbox: fc.sandbox,
         model: fc.model,
         max_address_rounds: fc.max_address_rounds,
+        on_findings_remaining: fc.on_findings_remaining,
         state_dir: fc.state_dir,
         phase_timeout_sec: fc.phase_timeout_sec,
         parallel: fc.parallel,
         max_parallel: fc.max_parallel,
         log_level: fc.log_level,
         log_file: fc.log_file,
+        stet_path: fc.stet_path,
+        stet_start_ref: fc.stet_start_ref,
     })
 }
 
@@ -198,12 +221,15 @@ fn load_env_layer(
         sandbox: env_fn("SANDBOX"),
         model: env_fn("MODEL"),
         max_address_rounds: parse_env_u32(env_fn, "MAX_ADDRESS_ROUNDS")?,
+        on_findings_remaining: env_fn("ON_FINDINGS_REMAINING"),
         state_dir: env_fn("STATE_DIR").map(PathBuf::from),
         phase_timeout_sec: parse_env_u64(env_fn, "PHASE_TIMEOUT_SEC")?,
         parallel: parse_env_bool(env_fn, "PARALLEL")?,
         max_parallel: parse_env_u32(env_fn, "MAX_PARALLEL")?,
         log_level: env_fn("LOG_LEVEL"),
         log_file: env_fn("LOG_FILE").map(PathBuf::from),
+        stet_path: env_fn("STET_PATH").map(PathBuf::from),
+        stet_start_ref: env_fn("STET_START_REF"),
     })
 }
 
@@ -270,9 +296,12 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         parallel: if args.parallel { Some(true) } else { None },
         max_parallel: args.max_parallel,
         max_address_rounds: args.max_address_rounds,
+        on_findings_remaining: args.on_findings_remaining.clone(),
         stet_commands: None,
         log_level: args.log_level.clone(),
         log_file: args.log_file.clone(),
+        stet_path: args.stet_path.clone(),
+        stet_start_ref: args.stet_start_ref.clone(),
     }
 }
 
@@ -292,6 +321,10 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .max_address_rounds
             .or(env.max_address_rounds)
             .or(file.max_address_rounds),
+        on_findings_remaining: cli
+            .on_findings_remaining
+            .or(env.on_findings_remaining)
+            .or(file.on_findings_remaining),
         state_dir: cli.state_dir.or(env.state_dir).or(file.state_dir),
         phase_timeout_sec: cli
             .phase_timeout_sec
@@ -301,6 +334,11 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
         max_parallel: cli.max_parallel.or(env.max_parallel).or(file.max_parallel),
         log_level: cli.log_level.or(env.log_level).or(file.log_level),
         log_file: cli.log_file.or(env.log_file).or(file.log_file),
+        stet_path: cli.stet_path.or(env.stet_path).or(file.stet_path),
+        stet_start_ref: cli
+            .stet_start_ref
+            .or(env.stet_start_ref)
+            .or(file.stet_start_ref),
     }
 }
 
@@ -325,10 +363,13 @@ mod tests {
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            on_findings_remaining: None,
             task: None,
             from_task: None,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         }
     }
 
@@ -344,6 +385,7 @@ mod tests {
         assert_eq!(cfg.sandbox, "disabled");
         assert_eq!(cfg.model, None);
         assert_eq!(cfg.max_address_rounds, 3);
+        assert_eq!(cfg.on_findings_remaining, "fail");
         assert_eq!(cfg.state_dir, PathBuf::from(".peal"));
         assert_eq!(cfg.phase_timeout_sec, 1800);
         assert!(!cfg.parallel);
@@ -434,10 +476,13 @@ model = "from-file"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            on_findings_remaining: None,
             task: None,
             from_task: None,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
 
@@ -496,10 +541,13 @@ agent_cmd = "from-file"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            on_findings_remaining: None,
             task: None,
             from_task: None,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
 
@@ -583,10 +631,13 @@ bogus_key = true
             parallel: true,
             max_parallel: Some(2),
             max_address_rounds: None,
+            on_findings_remaining: None,
             task: None,
             from_task: None,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
 
@@ -698,6 +749,7 @@ repo_path = "/r"
         assert_eq!(cfg.agent_cmd, "agent");
         assert_eq!(cfg.sandbox, "disabled");
         assert_eq!(cfg.max_address_rounds, 3);
+        assert_eq!(cfg.on_findings_remaining, "fail");
         assert_eq!(cfg.phase_timeout_sec, 1800);
         assert!(!cfg.parallel);
         assert_eq!(cfg.max_parallel, 4);
@@ -739,10 +791,13 @@ sandbox = "file-sandbox"
             parallel: false,
             max_parallel: None,
             max_address_rounds: None,
+            on_findings_remaining: None,
             task: None,
             from_task: None,
             log_level: None,
             log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
 
@@ -771,6 +826,89 @@ sandbox = "file-sandbox"
         assert!(
             format!("{err}").contains("PEAL_MAX_PARALLEL"),
             "should mention the variable name"
+        );
+    }
+
+    #[test]
+    fn on_findings_remaining_defaults_to_fail() {
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert_eq!(cfg.on_findings_remaining, "fail");
+    }
+
+    #[test]
+    fn on_findings_remaining_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+on_findings_remaining = "warn"
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert_eq!(cfg.on_findings_remaining, "warn");
+    }
+
+    #[test]
+    fn on_findings_remaining_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "ON_FINDINGS_REMAINING" {
+                Some("warn".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert_eq!(cfg.on_findings_remaining, "warn");
+    }
+
+    #[test]
+    fn on_findings_remaining_from_cli() {
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.on_findings_remaining = Some("warn".to_owned());
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert_eq!(cfg.on_findings_remaining, "warn");
+    }
+
+    #[test]
+    fn on_findings_remaining_cli_overrides_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "ON_FINDINGS_REMAINING" {
+                Some("warn".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.on_findings_remaining = Some("fail".to_owned());
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert_eq!(cfg.on_findings_remaining, "fail");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_on_findings_remaining() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo it.").unwrap();
+
+        let mut args = minimal_cli_args(Some(plan_path), Some(dir.path().to_path_buf()));
+        args.on_findings_remaining = Some("panic".to_owned());
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Invalid on_findings_remaining"),
+            "expected InvalidOnFindingsRemaining, got: {msg}"
         );
     }
 }

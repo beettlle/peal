@@ -237,6 +237,34 @@ flowchart LR
 
 ---
 
+## Phase 7 — Plan normalization and flexible input
+
+**Goal:** Allow users to pass arbitrary documents (PRDs, implementation plans, notes). Optionally normalize via Cursor CLI to the canonical plan format so the rest of the pipeline (Phases 1–6) is unchanged. Hybrid approach: regex for format detection and parsing; LLM only when input is not already in canonical format.
+
+| Subphase | Description | Can run in parallel with |
+| -------- | ----------- | ------------------------ |
+| **SP-7.1** | **Format detection** — Before parsing: detect whether the plan file matches the canonical format (e.g. regex for `^## Task\s+\d+` or documented phase-table pattern). Document the detection rule. If detected, parse with existing SP-1.1 logic; no Cursor call. | — |
+| **SP-7.2** | **Normalization invocation** — When format not detected and normalization is enabled (config or CLI): invoke Cursor CLI once with document content + instructions that specify exact output format (canonical `## Task N` / optional `(parallel)`). Capture stdout as normalized plan. Use same `agent_cmd` and workspace as run. Config: `normalize_plan` (bool); CLI: `--normalize`. | SP-7.1 |
+| **SP-7.3** | **Validation and retry** — Parse normalized output with existing plan parser (SP-1.1). On parse failure: clear error with snippet; optional configurable retry. Ensure single canonical format for all parsing. | SP-7.2 |
+| **SP-7.4** | **Config and docs** — Document `normalize_plan`, `--normalize`, when to use (arbitrary input vs. already canonical). Optional: config path for normalization prompt or inline prompt template. State/resume: document that resume uses the plan actually run (file or normalized output); if user re-normalizes, task identity may change. | SP-7.2 |
+
+**Parallelism:** SP-7.2 and SP-7.4 can be done in parallel after SP-7.1 when normalization path is implemented; SP-7.3 depends on SP-7.2.
+
+```mermaid
+flowchart LR
+  SP71[SP-7.1]
+  SP72[SP-7.2]
+  SP73[SP-7.3]
+  SP74[SP-7.4]
+  SP71 --> SP72
+  SP72 --> SP73
+  SP72 --> SP74
+```
+
+**Deliverable:** `peal run --plan <arbitrary-doc> --repo R [--normalize]` optionally normalizes then parses and runs; existing `--plan` behavior unchanged when document is already canonical or when `normalize_plan` is false.
+
+---
+
 ## Summary
 
 - **Config:** TOML; precedence CLI > env > file.
@@ -244,4 +272,5 @@ flowchart LR
 - **Cursor CLI:** `agent --print --plan` / `--workspace`; prompt as positional arg.
 - **Stet:** Real binary; phase 3 implemented and tested against it.
 - **Testing:** Unit tests with mocked subprocess; optional integration tests with real `agent`/`stet`.
-- **Dogfooding:** From **Phase 2** (plan + P1 + P2, no state); then with **Phase 3** (resume); then full loop with **Phase 4** (stet) and **Phase 5** (parallel).
+- **Plan normalization:** **Phase 7** — optional hybrid (regex detection + Cursor CLI normalization) for arbitrary input; canonical format parsed by existing logic.
+- **Dogfooding:** From **Phase 2** (plan + P1 + P2, no state); then with **Phase 3** (resume); then full loop with **Phase 4** (stet) and **Phase 5** (parallel); **Phase 7** (plan normalization) for flexible input.

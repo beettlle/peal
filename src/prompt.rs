@@ -34,6 +34,9 @@ const PLAN_DELIMITER: &str = "---PLAN---";
 /// Delimiter used to fence stet review output inside the Phase 3 prompt.
 const STET_DELIMITER: &str = "---STET---";
 
+/// Delimiter used to fence extracted suggestions inside the Phase 3 prompt.
+const SUGGESTIONS_DELIMITER: &str = "---SUGGESTIONS---";
+
 /// Build the Phase 1 (plan) prompt for a given task.
 ///
 /// The task content is wrapped in `---TASK---` delimiters so the agent
@@ -66,15 +69,34 @@ pub fn phase2(plan_text: &str) -> String {
 
 /// Build the Phase 3 (address stet findings) prompt.
 ///
-/// The stet output is wrapped in `---STET---` delimiters.  This prompt is
-/// used by SP-4.4 when stet reports findings after Phase 2 execution.
+/// Delegates to [`phase3_with_suggestions`] with no suggestions block.
 pub fn phase3(stet_output: &str) -> String {
-    format!(
+    phase3_with_suggestions(stet_output, None)
+}
+
+/// Build the Phase 3 prompt, optionally including an extracted suggestions block.
+///
+/// When `suggestions` is `Some`, a `---SUGGESTIONS---` fenced block is
+/// appended after the stet output so the agent can see machine-extracted
+/// fix proposals alongside the raw findings.
+pub fn phase3_with_suggestions(stet_output: &str, suggestions: Option<&str>) -> String {
+    let mut prompt = format!(
         "Address the following stet review findings. Apply fixes and run tests.\n\n\
          {STET_DELIMITER}\n\
          {stet_output}\n\
          {STET_DELIMITER}"
-    )
+    );
+
+    if let Some(sugg) = suggestions {
+        prompt.push_str(&format!(
+            "\n\nSuggested fixes from stet:\n\n\
+             {SUGGESTIONS_DELIMITER}\n\
+             {sugg}\n\
+             {SUGGESTIONS_DELIMITER}"
+        ));
+    }
+
+    prompt
 }
 
 #[cfg(test)]
@@ -196,6 +218,55 @@ mod tests {
         let output = "Finding 1: bad naming\nFinding 2: missing test\nFinding 3: dead code";
         let prompt = phase3(output);
         assert!(prompt.contains(output));
+    }
+
+    // -- phase3_with_suggestions tests --
+
+    #[test]
+    fn phase3_with_suggestions_includes_block() {
+        let prompt = phase3_with_suggestions("finding text", Some("Use X instead"));
+        assert!(
+            prompt.contains("---SUGGESTIONS---"),
+            "should contain SUGGESTIONS delimiter: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use X instead"),
+            "should contain suggestion text: {prompt}"
+        );
+        let sugg_count = prompt.matches("---SUGGESTIONS---").count();
+        assert_eq!(sugg_count, 2, "exactly two SUGGESTIONS delimiters expected");
+    }
+
+    #[test]
+    fn phase3_with_suggestions_none_matches_phase3() {
+        let a = phase3("some stet output");
+        let b = phase3_with_suggestions("some stet output", None);
+        assert_eq!(a, b, "phase3(x) and phase3_with_suggestions(x, None) must be identical");
+    }
+
+    #[test]
+    fn phase3_with_suggestions_delimiters_distinct() {
+        let prompt = phase3_with_suggestions("stet stuff", Some("suggestion"));
+        assert!(
+            !prompt.contains("---TASK---"),
+            "must not contain TASK delimiter"
+        );
+        assert!(
+            !prompt.contains("---PLAN---"),
+            "must not contain PLAN delimiter"
+        );
+        assert!(prompt.contains("---STET---"));
+        assert!(prompt.contains("---SUGGESTIONS---"));
+    }
+
+    #[test]
+    fn phase3_with_suggestions_preserves_stet_block() {
+        let stet = "warning: unused `x`\n  --> src/lib.rs:10";
+        let prompt = phase3_with_suggestions(stet, Some("remove x"));
+        assert!(
+            prompt.contains(stet),
+            "stet output should appear verbatim"
+        );
     }
 
     // -- Cross-phase delimiter isolation --

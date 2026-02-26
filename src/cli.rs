@@ -69,6 +69,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub max_address_rounds: Option<u32>,
 
+    /// Behavior when stet findings persist after all address rounds.
+    /// "fail" (default) returns an error; "warn" logs a warning and continues.
+    #[arg(long)]
+    pub on_findings_remaining: Option<String>,
+
     /// Run only the task with this index.
     #[arg(long, conflicts_with = "from_task")]
     pub task: Option<u32>,
@@ -86,6 +91,16 @@ pub struct RunArgs {
     /// in addition to the human-readable stderr output.
     #[arg(long)]
     pub log_file: Option<PathBuf>,
+
+    /// Explicit path to the stet binary. When omitted, stet is
+    /// auto-detected on PATH; if not found, Phase 3 is skipped.
+    #[arg(long)]
+    pub stet_path: Option<PathBuf>,
+
+    /// Git ref passed to `stet start <ref>`. When omitted, `stet start`
+    /// is invoked without a ref argument.
+    #[arg(long)]
+    pub stet_start_ref: Option<String>,
 }
 
 #[cfg(test)]
@@ -145,6 +160,8 @@ mod tests {
             "8",
             "--max-address-rounds",
             "5",
+            "--stet-start-ref",
+            "HEAD~1",
         ])
         .expect("should parse all flags");
 
@@ -159,6 +176,7 @@ mod tests {
                 assert!(args.parallel);
                 assert_eq!(args.max_parallel, Some(8));
                 assert_eq!(args.max_address_rounds, Some(5));
+                assert_eq!(args.stet_start_ref.as_deref(), Some("HEAD~1"));
             }
         }
     }

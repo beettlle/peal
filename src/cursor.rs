@@ -53,7 +53,7 @@ fn resolve_agent_cmd_with(
 ///
 /// On Unix this additionally checks the executable permission bits via
 /// `std::os::unix::fs::PermissionsExt`.
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     let Ok(meta) = path.metadata() else {
         return false;
     };

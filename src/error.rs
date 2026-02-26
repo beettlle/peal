@@ -46,4 +46,23 @@ pub enum PealError {
 
     #[error("Failed to write state file {path}: {detail}")]
     StateWriteFailed { path: PathBuf, detail: String },
+
+    #[error("stet start failed: {detail}")]
+    StetStartFailed { detail: String },
+
+    #[error("stet run failed: {detail}")]
+    StetRunFailed { detail: String },
+
+    #[error("stet finish failed: {detail}")]
+    StetFinishFailed { detail: String },
+
+    #[error("Task {task_index}: {remaining_count} stet findings remain after {rounds} address round(s)")]
+    StetFindingsRemain {
+        task_index: u32,
+        rounds: u32,
+        remaining_count: usize,
+    },
+
+    #[error("Invalid on_findings_remaining value '{value}' (expected \"fail\" or \"warn\")")]
+    InvalidOnFindingsRemaining { value: String },
 }

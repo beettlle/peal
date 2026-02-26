@@ -1,7 +1,8 @@
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use peal::cli::{Cli, Commands};
 use peal::config::PealConfig;
@@ -9,6 +10,7 @@ use peal::cursor;
 use peal::plan;
 use peal::runner;
 use peal::state;
+use peal::stet;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -33,6 +35,27 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             config.validate()?;
 
             let agent_path = cursor::resolve_agent_cmd(&config.agent_cmd)?;
+
+            let stet_path = stet::resolve_stet(config.stet_path.as_deref());
+            match &stet_path {
+                Some(p) => info!(stet_path = %p.display(), "stet found, phase 3 enabled"),
+                None => info!("stet not found, phase 3 will be skipped"),
+            }
+
+            if let Some(ref sp) = stet_path {
+                info!("starting stet session");
+                let stet_out = stet::start_session(
+                    sp,
+                    config.stet_start_ref.as_deref(),
+                    &config.repo_path,
+                    Some(Duration::from_secs(config.phase_timeout_sec)),
+                )?;
+                info!(
+                    stdout_len = stet_out.stdout.len(),
+                    stderr_len = stet_out.stderr.len(),
+                    "stet session started"
+                );
+            }
 
             info!(
                 plan = %config.plan_path.display(),
@@ -99,19 +122,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
-            let results = runner::run_all(
+            let run_result = runner::run_all(
                 &agent_path,
                 &config,
                 &parsed,
                 &mut peal_state,
                 &config.state_dir,
-            )?;
+                stet_path.as_deref(),
+            );
+
+            if let Some(ref sp) = stet_path {
+                let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+                match stet::finish_session(sp, &config.repo_path, timeout) {
+                    Ok(out) => info!(
+                        stdout_len = out.stdout.len(),
+                        stderr_len = out.stderr.len(),
+                        "stet finish succeeded"
+                    ),
+                    Err(e) => warn!(%e, "stet finish failed (best-effort)"),
+                }
+            }
+
+            let results = run_result?;
 
             for r in &results {
                 info!(
                     task_index = r.task_index,
                     plan_text_len = r.plan_text.len(),
                     phase2_stdout_len = r.phase2_stdout.len(),
+                    phase3_rounds = r.phase3_outcome.as_ref().map(|o| o.rounds_used),
+                    phase3_resolved = r.phase3_outcome.as_ref().map(|o| o.findings_resolved),
                     "task complete"
                 );
             }
