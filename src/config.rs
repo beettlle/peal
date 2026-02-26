@@ -267,7 +267,7 @@ impl PealConfig {
                 .unwrap_or(DEFAULT_PHASE_RETRY_COUNT),
             parallel: merged
                 .parallel
-                .or_else(|| merged.max_parallel.map(|_| true))
+                .or_else(|| merged.max_parallel.and_then(|n| if n > 0 { Some(true) } else { None }))
                 .unwrap_or(false),
             max_parallel: merged.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL),
             continue_with_remaining_tasks: merged.continue_with_remaining_tasks.unwrap_or(false),

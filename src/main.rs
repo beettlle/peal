@@ -1,8 +1,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-#[cfg(unix)]
-#[allow(unused_imports)]
+#[cfg(all(unix, test))]
 use std::os::unix::fs::PermissionsExt;
 
 use clap::Parser;
