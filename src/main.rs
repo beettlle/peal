@@ -368,7 +368,7 @@ mod tests {
             "peal",
             "prompt",
             "--output",
-            out_path.to_str().unwrap(),
+            out_path.to_str().expect("temp dir path is valid UTF-8"),
         ])
         .unwrap();
 
