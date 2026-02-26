@@ -1,6 +1,9 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use clap::Parser;
 use tracing::{error, info, warn};
 
@@ -125,7 +128,56 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 "config loaded"
             );
 
-            let parsed = plan::parse_plan_file(&config.plan_path)?;
+            let plan_content = std::fs::read_to_string(&config.plan_path).map_err(|e| {
+                let peal_err = if e.kind() == std::io::ErrorKind::NotFound {
+                    peal::error::PealError::PlanFileNotFound {
+                        path: config.plan_path.clone(),
+                    }
+                } else {
+                    peal::error::PealError::InvalidPlanFile {
+                        path: config.plan_path.clone(),
+                    }
+                };
+                anyhow::anyhow!(peal_err)
+            })?;
+
+            let normalize_enabled = config.normalize_plan || args.normalize;
+
+            let parsed = if plan::is_canonical_plan_format(&plan_content) {
+                plan::parse_plan(&plan_content)?
+            } else if normalize_enabled {
+                info!("plan format not canonical, normalizing via agent");
+                let mut parsed_plan = None;
+                let attempts = 1 + config.normalize_retry_count;
+                for attempt in 0..attempts {
+                    let normalized = plan::normalize_via_agent(&plan_content, &agent_path, &config)
+                        .map_err(anyhow::Error::from)?;
+                    match plan::parse_plan_or_fail_with_snippet(&normalized) {
+                        Ok(p) => {
+                            parsed_plan = Some(p);
+                            break;
+                        }
+                        Err(peal::error::PealError::NormalizationParseFailed { snippet }) => {
+                            if attempt + 1 < attempts {
+                                warn!(
+                                    attempt = attempt + 1,
+                                    retries_left = attempts - attempt - 1,
+                                    "normalized output did not parse, retrying normalization"
+                                );
+                            } else {
+                                return Err(peal::error::PealError::NormalizationParseFailed {
+                                    snippet,
+                                }
+                                .into());
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                parsed_plan.expect("normalize loop exits with Some(parsed) or return Err")
+            } else {
+                plan::parse_plan(&plan_content)?
+            };
 
             let parsed = match (args.task, args.from_task) {
                 (Some(idx), None) => {
@@ -424,6 +476,171 @@ mod tests {
         .unwrap();
 
         run(cli).expect("should succeed with valid plan file and repo directory");
+    }
+
+    /// Canonical plan with --normalize: no normalization call; parse directly and run.
+    #[test]
+    fn run_canonical_plan_with_normalize_flag_parses_without_agent_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo something").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "echo",
+            "--normalize",
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        run(cli).expect("canonical plan with --normalize should parse directly and succeed");
+    }
+
+    /// Non-canonical plan with --normalize: agent is invoked once; stub echoes canonical plan.
+    #[test]
+    #[cfg(unix)]
+    fn run_non_canonical_with_normalize_invokes_agent_then_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "Some PRD or notes. No ## Task headings.").unwrap();
+
+        let stub = dir.path().join("stub_agent.sh");
+        fs::write(&stub, "#!/bin/sh\nprintf '%s\\n' '## Task 1' 'Do it.'\n").unwrap();
+        let mut perms = fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stub, perms).unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            stub.to_str().unwrap(),
+            "--normalize",
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        run(cli).expect("non-canonical + --normalize should invoke stub, then parse and run");
+    }
+
+    /// Non-canonical + --normalize with stub that returns non-canonical output; retry 0 -> NormalizationParseFailed with snippet.
+    #[test]
+    #[cfg(unix)]
+    fn run_normalize_parse_failure_returns_error_with_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "Some PRD. No ## Task headings.").unwrap();
+
+        let stub = dir.path().join("stub_echo_garbage.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\necho 'Agent returned non-canonical output.'\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stub, perms).unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            stub.to_str().unwrap(),
+            "--normalize",
+            "--normalize-retries",
+            "0",
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        let result = run(cli);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("could not be parsed"),
+            "expected parse-failure error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("Agent returned") || err_msg.contains("Snippet:"),
+            "error should include snippet of output, got: {err_msg}"
+        );
+    }
+
+    /// Stub returns bad output on first call, canonical on second; normalize_retry_count=1 -> success after two invocations.
+    #[test]
+    #[cfg(unix)]
+    fn run_normalize_retry_succeeds_on_second_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "PRD. No ## Task headings.").unwrap();
+
+        let stub = dir.path().join("stub_retry.sh");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+# Agent runs with cwd = repo; use a counter file in cwd.
+f=norm_count
+c=0
+[ -f "$f" ] && c=$(cat "$f")
+c=$((c+1))
+echo "$c" > "$f"
+if [ "$c" -eq 1 ]; then
+  echo "garbage"
+  exit 0
+fi
+printf '%s\n' '## Task 1' 'Do it.'
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stub, perms).unwrap();
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            stub.to_str().unwrap(),
+            "--normalize",
+            "--normalize-retries",
+            "1",
+            "--stet-path",
+            "/nonexistent",
+        ])
+        .unwrap();
+
+        run(cli).expect("retry should succeed on second normalization");
+
+        let count: u32 = fs::read_to_string(dir.path().join("norm_count"))
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        assert_eq!(count, 2, "normalization should have been invoked twice");
     }
 
     #[test]

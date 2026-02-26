@@ -43,6 +43,9 @@ Every key that affects `PealConfig` is listed below. Required keys must be provi
 | `on_stet_fail` | `on_stet_fail` | `ON_STET_FAIL` | `--on-stet-fail` | `"fail"` \| `"retry_once"` \| `"skip"` | `"fail"` |
 | `post_run_commands` | `post_run_commands` | `POST_RUN_COMMANDS` (comma-sep) | `--post-run-commands` | list of strings | `[]` |
 | `post_run_timeout_sec` | `post_run_timeout_sec` | `POST_RUN_TIMEOUT_SEC` | `--post-run-timeout-sec` | u64 | — |
+| `normalize_plan` | `normalize_plan` | `NORMALIZE_PLAN` (bool) | `--normalize` | bool | `false` |
+| `normalize_retry_count` | `normalize_retry_count` | `NORMALIZE_RETRY_COUNT` | `--normalize-retries` | u32 | `0` |
+| `normalize_prompt_path` | `normalize_prompt_path` | `NORMALIZE_PROMPT_PATH` | — | path | — |
 
 **Notes:**
 
@@ -53,6 +56,28 @@ Every key that affects `PealConfig` is listed below. Required keys must be provi
   - Extra-args env vars (`STET_START_EXTRA_ARGS`, `STET_RUN_EXTRA_ARGS`): split on comma and whitespace.
 - **`stet_dismiss_patterns`:** Valid `reason` values: `false_positive`, `already_correct`, `wrong_suggestion`, `out_of_scope`. In TOML, use an array of tables with `pattern` and `reason` keys. There is no CLI flag; use TOML or env only.
 - **Config file:** Pass the path with `--config`. If `--config` is not set, no file is loaded.
+
+---
+
+## Plan normalization
+
+When the plan file does **not** match the canonical format (e.g. no `## Task N` headings), and `normalize_plan` or `--normalize` is true, peal invokes the Cursor CLI **once** with the file content and instructions to convert it to canonical format; the agent’s stdout is then parsed as the plan.
+
+- **When to use `--normalize` / `normalize_plan = true`:**
+  - **Arbitrary input:** PRDs, implementation plans, notes, or other free-form docs you want turned into a PEAL plan in one shot.
+- **When not to use:**
+  - **Already canonical:** If the file already has `## Task 1`, `## Task 2`, … headings, peal detects that and parses directly; no agent call. Adding `--normalize` does nothing in that case (no extra invocation).
+- **Precedence:** CLI `--normalize` overrides env and file; same as other options. `normalize_retry_count` (or `--normalize-retries`) sets how many extra attempts to run normalize+parse on parse failure (default 0).
+
+**Custom normalization prompt:** If `normalize_prompt_path` is set (TOML or `PEAL_NORMALIZE_PROMPT_PATH`), peal reads that file and uses its content as the full normalization prompt. A single placeholder `{{DOC}}` in the file is replaced by the plan document content. If unset, the built-in normalization prompt is used. The path may be absolute or relative to the process current working directory. If the file is missing or unreadable, normalization fails with a clear error.
+
+---
+
+## State and resume
+
+Resume uses the **plan actually run**: that is, the parsed plan used for that run — either the file content (when canonical) or the **normalized output** from the single normalization invocation. State is keyed only by `plan_path` and `repo_path`; the content (file vs normalized) is not stored in state.
+
+**Re-normalizing:** If you run again with the same `--plan` and `--repo` but with normalization enabled (or with a modified source file), the LLM may produce different normalized output. Task identity (Task 1, Task 2, …) and count can change. Resuming will still match on `plan_path` and `repo_path` and skip by **task index**; those indices may no longer correspond to the same logical tasks. So if you re-normalize, treat it as a new run: consider clearing state (e.g. remove `.peal/state.json`) or using a different `state_dir` if you need a clean resume.
 
 ---
 

@@ -44,6 +44,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub repo: Option<PathBuf>,
 
+    /// Normalize non-canonical plan via Cursor CLI before parsing (SP-7.2).
+    #[arg(long, default_value_t = false)]
+    pub normalize: bool,
+
+    /// Number of retries for normalize+parse when normalized output fails to parse (SP-7.3). Default 0.
+    #[arg(long)]
+    pub normalize_retry_count: Option<u32>,
+
     /// Path to a TOML configuration file.
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -218,6 +226,7 @@ mod tests {
             "--post-run-commands=stet finish, echo done",
             "--post-run-timeout-sec",
             "90",
+            "--normalize",
         ])
         .expect("should parse all flags");
 
@@ -243,7 +252,28 @@ mod tests {
                 assert_eq!(args.on_stet_fail.as_deref(), Some("skip"));
                 assert_eq!(args.post_run_commands.as_deref(), Some("stet finish, echo done"));
                 assert_eq!(args.post_run_timeout_sec, Some(90));
+                assert!(args.normalize);
             }
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
+        }
+    }
+
+    #[test]
+    fn normalize_retries_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            "p.md",
+            "--repo",
+            "/r",
+            "--normalize-retries",
+            "2",
+        ])
+        .expect("should parse --normalize-retries");
+
+        match cli.command {
+            Commands::Run(args) => assert_eq!(args.normalize_retry_count, Some(2)),
             Commands::Prompt(_) => unreachable!("test uses run subcommand"),
         }
     }

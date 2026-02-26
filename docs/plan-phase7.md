@@ -17,3 +17,5 @@ SP-7.3 — Validation and retry. Parse normalized output with existing plan pars
 ## Task 4
 
 SP-7.4 — Config and docs. Document `normalize_plan`, `--normalize`, when to use (arbitrary input vs. already canonical). Optional: config path for normalization prompt or inline prompt template. State/resume: document that resume uses the plan actually run (file or normalized output); if user re-normalizes, task identity may change.
+
+**Implemented.** See `docs/configuration.md`: configuration keys table (`normalize_plan`, `normalize_retry_count`), **Plan normalization** subsection, and **State and resume** subsection.

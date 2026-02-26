@@ -246,7 +246,25 @@ flowchart LR
 | **SP-7.1** | **Format detection** — Before parsing: detect whether the plan file matches the canonical format (e.g. regex for `^## Task\s+\d+` or documented phase-table pattern). Document the detection rule. If detected, parse with existing SP-1.1 logic; no Cursor call. | — |
 | **SP-7.2** | **Normalization invocation** — When format not detected and normalization is enabled (config or CLI): invoke Cursor CLI once with document content + instructions that specify exact output format (canonical `## Task N` / optional `(parallel)`). Capture stdout as normalized plan. Use same `agent_cmd` and workspace as run. Config: `normalize_plan` (bool); CLI: `--normalize`. | SP-7.1 |
 | **SP-7.3** | **Validation and retry** — Parse normalized output with existing plan parser (SP-1.1). On parse failure: clear error with snippet; optional configurable retry. Ensure single canonical format for all parsing. | SP-7.2 |
+
+**SP-7.3 (Validation and retry) — implemented**
+
+- **Single parser:** All plan content (from file or from normalization) is parsed only via `plan::parse_plan(content)` (which normalises CRLF→LF and extracts tasks). There is no second parser.
+- **Parse failure after normalization:** When the agent returns a string but that string is not in canonical format or yields zero tasks, this is treated as a distinct “parse failure” (not spawn/timeout/exit). The run fails with `NormalizationParseFailed { snippet }`; the user-facing message includes a bounded snippet (e.g. first 500 chars / 20 lines) of the normalized output.
+- **Retry:** `normalize_retry_count` (default 0) applies only to the normalize+parse step. On parse failure, if retries remain, peal logs and calls the agent again with the same plan content; when retries are exhausted, it returns the error with snippet. Agent failures (spawn/timeout/non-zero exit) are not retried by this setting.
+- **Config:** `normalize_retry_count` is available in TOML, env (`PEAL_NORMALIZE_RETRY_COUNT`), and CLI (`--normalize-retries`). Precedence: CLI > env > file > default (0).
 | **SP-7.4** | **Config and docs** — Document `normalize_plan`, `--normalize`, when to use (arbitrary input vs. already canonical). Optional: config path for normalization prompt or inline prompt template. State/resume: document that resume uses the plan actually run (file or normalized output); if user re-normalizes, task identity may change. | SP-7.2 |
+
+**SP-7.4 (Config and docs) — implemented**
+
+- **Configuration reference:** `docs/configuration.md` — config keys table includes `normalize_plan` and `normalize_retry_count` (TOML, env, CLI, defaults); **Plan normalization** subsection describes what normalization does, when to use it (arbitrary input) and when not (already canonical), and precedence.
+- **State and resume:** Same doc has a **State and resume** subsection: resume uses the plan actually run (parsed from file or normalized output); state keyed by `plan_path` + `repo_path` only; re-normalizing can change task count/order so task indices may not match — recommend clearing `.peal/state.json` or using another `state_dir` when re-normalizing.
+
+**Plan format detection (SP-7.1)**
+
+- **Canonical plan format:** The content contains at least one line that matches `^## Task\s+\d+` after normalizing CRLF to LF. Trailing `\s*(\(parallel\))?\s*` is allowed but not required for detection. A single line-by-line scan for this pattern is used to decide “parse with SP-1.1”; no full parse is needed for detection.
+- **Phase-table format:** Documents that use only a phase-table style (e.g. `| **SP-1.1** | ... |` as in this implementation plan) are **not** treated as canonical in v1. Such documents are “not detected” and fall under normalization (SP-7.2) when the user enables it.
+- **Reference:** PRD §4 for the full canonical task format.
 
 **Parallelism:** SP-7.2 and SP-7.4 can be done in parallel after SP-7.1 when normalization path is implemented; SP-7.3 depends on SP-7.2.
 
@@ -262,6 +280,53 @@ flowchart LR
 ```
 
 **Deliverable:** `peal run --plan <arbitrary-doc> --repo R [--normalize]` optionally normalizes then parses and runs; existing `--plan` behavior unchanged when document is already canonical or when `normalize_plan` is false.
+
+**Implementation plan for SP-7.2 (Normalization invocation)**
+
+1. **Config**
+   - Add `normalize_plan: bool` to `PealConfig` (default `false`).
+   - Add `normalize_plan: Option<bool>` to `FileConfig`, `ConfigLayer`, and env layer; wire in `load_file_layer`, `load_env_layer` (e.g. `PEAL_NORMALIZE_PLAN`), `cli_layer_from`, and `merge_layers`. Resolve to `merged.normalize_plan.unwrap_or(false)` in `load_with_env`.
+
+2. **CLI**
+   - Add `--normalize` to `RunArgs` in `cli.rs`: `#[arg(long, default_value_t = false)] pub normalize: bool`. Precedence: CLI > env > file (so `--normalize` overrides config).
+
+3. **Normalization prompt**
+   - In `prompt.rs`, add `normalize_plan_prompt(document_content: &str) -> String`. Instructions: output must be a single markdown in canonical format — headings exactly `## Task 1`, `## Task 2`, …; optional suffix ` (parallel)` per task; task body from next line until next `## Task N` or EOF. Fence the user document in a distinct delimiter (e.g. `---DOC---`) so the agent treats it as input, not instructions. Reuse same injection-mitigation approach as phase1/phase2.
+
+4. **Normalization invocation**
+   - Add a function that runs the Cursor CLI once for normalization (e.g. `plan::normalize_via_agent` in `plan.rs` or a small `plan_normalize.rs`). Signature: `(document_content: &str, agent_path: &Path, config: &PealConfig) -> Result<String, PealError>`.
+   - Build prompt with `prompt::normalize_plan_prompt(document_content)`.
+   - Build argv the same way as Phase 1: `--print --plan --workspace <config.repo_path> --output-format text [--model <config.model or "auto">] <prompt>` (single positional arg). Use `subprocess::run_command` with `config.repo_path` as cwd and `config.phase_timeout_sec` as timeout.
+   - On success (exit 0, not timed out), return `result.stdout` as the normalized plan string. On failure, return a `PealError` (e.g. `PhaseSpawnFailed` or a dedicated `NormalizationFailed` with snippet).
+
+5. **Run flow in `main.rs`**
+   - After `config.validate()` and `cursor::resolve_agent_cmd`, read plan file once: `let plan_content = std::fs::read_to_string(&config.plan_path)?;`.
+   - Compute “normalization enabled”: `let normalize_enabled = config.normalize_plan || args.normalize;` (ensure `RunArgs` has `normalize` from step 2).
+   - If `plan::is_canonical_plan_format(&plan_content)`: use existing path `plan::parse_plan(&plan_content)?` (no agent call).
+   - Else if `normalize_enabled`: call `plan::normalize_via_agent(&plan_content, &agent_path, &config)?`, then `plan::parse_plan(&normalized)?`. On parse failure, surface clear error with snippet (SP-7.3 can add retry later).
+   - Else: call `plan::parse_plan(&plan_content)?` (current behavior; non-canonical docs may produce 0 tasks and hit existing “invalid plan”/empty-task handling).
+   - From here on, the rest of `main` and `runner` stay unchanged: they receive a `ParsedPlan` and run phases 1–6 as today. State/resume continues to key off `plan_path` and `repo_path`; the “plan actually run” is the parsed plan (same structure whether from file or normalized).
+
+6. **Tests**
+   - **Prompt:** Unit test that `normalize_plan_prompt` contains the canonical format instructions, the delimiter, and the document content.
+   - **No double invocation:** Test (with mocked or stub agent) that when format is detected, no Cursor CLI is invoked for normalization.
+   - **Invocation when not detected + enabled:** Test that when format is not detected and `normalize_plan` or `--normalize` is true, the agent is invoked once with the expected argv (same `agent_cmd`, `--plan`, `--workspace` = repo, prompt containing doc + instructions); capture stdout and parse with `parse_plan`.
+   - **Config/CLI:** Test that `normalize_plan` from file and `PEAL_NORMALIZE_PLAN` and `--normalize` are merged with correct precedence (CLI > env > file).
+
+7. **Edge cases**
+   - Empty or very large document: same bounded read as in subprocess (no extra limit for normalization input beyond what’s in the file read).
+   - Agent not found: already handled by `resolve_agent_cmd` before we read the plan.
+   - Normalization timeout / non-zero exit: fail the run with a clear error; no retry in SP-7.2 (SP-7.3 can add optional retry).
+
+**Files to touch**
+
+| File | Changes |
+|------|--------|
+| `src/config.rs` | `PealConfig.normalize_plan`, `FileConfig`/`ConfigLayer`/merge/env/cli for `normalize_plan` |
+| `src/cli.rs` | `RunArgs.normalize` |
+| `src/prompt.rs` | `normalize_plan_prompt(document_content)` |
+| `src/plan.rs` (or new `src/plan_normalize.rs`) | `normalize_via_agent(content, agent_path, config)` building argv and calling `subprocess::run_command` |
+| `src/main.rs` | Read plan to string; branch on format + normalize_enabled; call normalizer when needed; parse and pass `ParsedPlan` as today |
 
 ---
 

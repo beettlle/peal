@@ -37,6 +37,40 @@ const STET_DELIMITER: &str = "---STET---";
 /// Delimiter used to fence extracted suggestions inside the Phase 3 prompt.
 const SUGGESTIONS_DELIMITER: &str = "---SUGGESTIONS---";
 
+/// Delimiter used to fence the user document in the normalization prompt (SP-7.2).
+const DOC_DELIMITER: &str = "---DOC---";
+
+/// Placeholder in custom normalization prompt files; replaced by the plan document content.
+pub const NORMALIZE_PROMPT_PLACEHOLDER: &str = "{{DOC}}";
+
+/// Build the normalization prompt from a custom template string (e.g. from a file).
+/// Replaces the single placeholder `NORMALIZE_PROMPT_PLACEHOLDER` with `document_content`.
+pub fn build_normalize_prompt_from_template(template: &str, document_content: &str) -> String {
+    template.replace(NORMALIZE_PROMPT_PLACEHOLDER, document_content)
+}
+
+/// Build the plan normalization prompt (SP-7.2).
+///
+/// Asks the agent to convert arbitrary document content into the canonical plan format.
+/// The user document is fenced with `---DOC---` so it is treated as input, not instructions.
+///
+/// Output format: headings exactly `## Task 1`, `## Task 2`, …; optional suffix ` (parallel)` per task;
+/// task body from the line after the heading until the next `## Task N` or EOF.
+pub fn normalize_plan_prompt(document_content: &str) -> String {
+    const INSTRUCTIONS: &str = "Convert the following document into a PEAL plan in canonical format.\n\n\
+Output rules:\n\
+- Use exactly these headings: ## Task 1, ## Task 2, ## Task 3, … (one per task).\n\
+- Optionally add \" (parallel)\" after the task number for tasks that can run in parallel (e.g. ## Task 2 (parallel)).\n\
+- The task body is everything from the line after the heading until the next ## Task N or end of file.\n\
+- Output only the plan markdown (no preamble or explanation).\n\n";
+    format!(
+        "{INSTRUCTIONS}\
+         {DOC_DELIMITER}\n\
+         {document_content}\n\
+         {DOC_DELIMITER}"
+    )
+}
+
 /// Build the triage prompt: stet output plus the single question "Anything to address from this review?"
 /// Used by Phase 3 auto-dismiss to let the LLM decide which findings to dismiss.
 pub fn triage_prompt(stet_output: &str) -> String {
@@ -281,6 +315,50 @@ mod tests {
     }
 
     // -- Cross-phase delimiter isolation --
+
+    #[test]
+    fn normalize_plan_prompt_contains_instructions_and_delimiter_and_doc() {
+        let doc = "Some PRD or notes.";
+        let prompt = normalize_plan_prompt(doc);
+        assert!(
+            prompt.contains("canonical format"),
+            "should describe canonical format: {prompt}"
+        );
+        assert!(
+            prompt.contains("## Task 1"),
+            "should describe task heading format: {prompt}"
+        );
+        assert!(
+            prompt.contains("(parallel)"),
+            "should mention parallel marker: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches(DOC_DELIMITER).count(),
+            2,
+            "exactly two ---DOC--- delimiters"
+        );
+        assert!(
+            prompt.contains("Some PRD or notes."),
+            "should contain document content verbatim"
+        );
+    }
+
+    #[test]
+    fn normalize_plan_prompt_fences_empty_doc() {
+        let prompt = normalize_plan_prompt("");
+        assert!(prompt.contains("---DOC---\n\n---DOC---"));
+    }
+
+    #[test]
+    fn build_normalize_prompt_from_template_replaces_placeholder() {
+        let template = "Convert the following:\n{{DOC}}\nEnd.";
+        let doc = "my plan content";
+        let prompt = build_normalize_prompt_from_template(template, doc);
+        assert!(!prompt.contains("{{DOC}}"), "placeholder should be replaced");
+        assert!(prompt.contains("my plan content"), "document content should appear");
+        assert!(prompt.starts_with("Convert the following:\n"));
+        assert!(prompt.ends_with("\nEnd."));
+    }
 
     #[test]
     fn delimiters_are_distinct_across_phases() {

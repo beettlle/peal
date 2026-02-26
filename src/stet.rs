@@ -1321,6 +1321,9 @@ exit 0
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
         let run_stdout = r#"{"findings":[{"id":"f1","message":"unused"}]}"#;
         let result = dismiss_non_actionable_and_rerun(&stet_path, &agent_path, &config, run_stdout).unwrap();
@@ -1546,6 +1549,9 @@ exit 0
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let stet_result = StetRunResult {
@@ -1610,6 +1616,9 @@ exit 0
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let stet_result = StetRunResult {
@@ -1696,6 +1705,9 @@ exit 0
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let initial = StetRunResult {
@@ -1750,6 +1762,9 @@ exit 0
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let initial = StetRunResult {
@@ -1802,6 +1817,9 @@ exit 0
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let initial = StetRunResult {
@@ -1935,6 +1953,9 @@ exit 0
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let initial = StetRunResult {

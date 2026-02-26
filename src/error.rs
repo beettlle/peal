@@ -78,4 +78,15 @@ pub enum PealError {
 
     #[error("Invalid on_stet_fail value '{value}' (expected \"fail\", \"retry_once\", or \"skip\")")]
     InvalidOnStetFail { value: String },
+
+    #[error("Plan normalization failed: {detail}")]
+    NormalizationFailed { detail: String },
+
+    #[error("Normalization prompt file {path}: {detail}")]
+    NormalizePromptFileFailed { path: PathBuf, detail: String },
+
+    /// Normalized plan output could not be parsed (no canonical tasks found).
+    /// Includes a bounded snippet of the normalized output for debugging.
+    #[error("Normalized plan output could not be parsed (no canonical tasks found). Snippet:\n{snippet}")]
+    NormalizationParseFailed { snippet: String },
 }

@@ -792,6 +792,11 @@ mod tests {
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
             on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         }
     }
 
@@ -892,6 +897,11 @@ mod tests {
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
             on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1061,6 +1071,11 @@ mod tests {
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
             on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1242,6 +1257,11 @@ mod tests {
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
             on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let mut state = fresh_state();
@@ -1883,6 +1903,11 @@ mod tests {
             stet_disable_llm_triage: false,
             stet_dismiss_patterns: vec![],
             on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let mut state = fresh_state();

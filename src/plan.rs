@@ -1,9 +1,27 @@
+//! Plan file parsing and canonical format detection.
+//!
+//! **Format detection (SP-7.1):** Canonical format = at least one line matching `^## Task\s+\d+`
+//! after CRLF→LF. Phase-table format is not canonical in v1. See `is_canonical_plan_format` and
+//! `docs/implementation-plan.md` (Phase 7).
+
+use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use regex::Regex;
+use tracing::debug;
 
+use crate::config::PealConfig;
 use crate::error::PealError;
+use crate::prompt;
+use crate::subprocess;
+
+/// Maximum snippet length (chars) for normalized-parse-failure error (SP-7.3).
+const PARSE_FAIL_SNIPPET_MAX_CHARS: usize = 500;
+/// Maximum number of lines to include in snippet before truncation.
+const PARSE_FAIL_SNIPPET_MAX_LINES: usize = 20;
+const PARSE_FAIL_TRUNCATED_SUFFIX: &str = "... (truncated)";
 
 /// Compiled once; the pattern is a valid literal so init cannot fail at runtime.
 static HEADING_RE: OnceLock<Regex> = OnceLock::new();
@@ -12,6 +30,153 @@ fn heading_re() -> &'static Regex {
     HEADING_RE.get_or_init(|| {
         Regex::new(r"^## Task\s+(\d+)\s*(\(parallel\))?\s*$").expect("valid literal regex")
     })
+}
+
+/// Lazy regex for canonical format detection (SP-7.1).
+/// Matches a line that starts with `## Task` followed by digits; used only for detection, not full parse.
+static CANONICAL_DETECT_RE: OnceLock<Regex> = OnceLock::new();
+
+fn canonical_detect_re() -> &'static Regex {
+    CANONICAL_DETECT_RE.get_or_init(|| {
+        Regex::new(r"^## Task\s+\d+").expect("valid literal regex")
+    })
+}
+
+/// Returns true if the content is in canonical plan format (SP-7.1).
+///
+/// Canonical format: at least one line matches `^## Task\s+\d+` after normalizing CRLF to LF.
+/// Trailing `(parallel)` or whitespace is allowed but not required for detection.
+/// Phase-table format (e.g. `| **SP-1.1** | ... |`) is not canonical in v1.
+pub fn is_canonical_plan_format(content: &str) -> bool {
+    let normalized = content.replace("\r\n", "\n");
+    let re = canonical_detect_re();
+    normalized.lines().any(|line| re.is_match(line))
+}
+
+/// Invoke the Cursor CLI once to normalize document content into canonical plan format (SP-7.2).
+///
+/// Uses the same argv layout as Phase 1: `--print --plan --workspace <repo> --output-format text`
+/// plus optional `--model`, then the prompt as a single positional arg.
+/// On success returns the agent's stdout as the normalized plan string.
+/// On spawn failure, timeout, or non-zero exit returns a `PealError`.
+/// When `config.normalize_prompt_path` is set, the prompt is built from that file (placeholder `{{DOC}}` replaced by document content); otherwise the built-in prompt is used.
+pub fn normalize_via_agent(
+    document_content: &str,
+    agent_path: &Path,
+    config: &PealConfig,
+) -> Result<String, PealError> {
+    let prompt = build_normalize_prompt(document_content, config)?;
+    let args = normalization_argv(config, &prompt);
+    let timeout = Duration::from_secs(config.phase_timeout_sec);
+    let agent_str = agent_path.to_string_lossy();
+
+    let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
+        .map_err(|e| PealError::NormalizationFailed {
+            detail: format!("spawn failed: {}", e),
+        })?;
+
+    if result.timed_out {
+        return Err(PealError::NormalizationFailed {
+            detail: format!(
+                "normalization timed out after {}s",
+                config.phase_timeout_sec
+            ),
+        });
+    }
+    if !result.success() {
+        let snippet = result
+            .stderr
+            .lines()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let snippet = snippet.trim();
+        return Err(PealError::NormalizationFailed {
+            detail: format!(
+                "agent exited with code {:?}{}",
+                result.exit_code,
+                if snippet.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", snippet)
+                }
+            ),
+        });
+    }
+
+    Ok(result.stdout)
+}
+
+/// Build the normalization prompt: from custom file if `config.normalize_prompt_path` is set, else built-in.
+fn build_normalize_prompt(document_content: &str, config: &PealConfig) -> Result<String, PealError> {
+    match &config.normalize_prompt_path {
+        Some(path) => {
+            let template = fs::read_to_string(path).map_err(|e| PealError::NormalizePromptFileFailed {
+                path: path.clone(),
+                detail: e.to_string(),
+            })?;
+            Ok(prompt::build_normalize_prompt_from_template(&template, document_content))
+        }
+        None => Ok(prompt::normalize_plan_prompt(document_content)),
+    }
+}
+
+/// Build a bounded snippet from normalized output for parse-failure errors (SP-7.3).
+/// Uses at most PARSE_FAIL_SNIPPET_MAX_LINES lines and PARSE_FAIL_SNIPPET_MAX_CHARS chars.
+fn snippet_for_parse_failure(normalized: &str) -> String {
+    let lines: Vec<&str> = normalized.lines().take(PARSE_FAIL_SNIPPET_MAX_LINES).collect();
+    let by_lines = lines.join("\n");
+    if by_lines.len() <= PARSE_FAIL_SNIPPET_MAX_CHARS {
+        if normalized.lines().count() > PARSE_FAIL_SNIPPET_MAX_LINES {
+            format!("{}\n{}", by_lines, PARSE_FAIL_TRUNCATED_SUFFIX)
+        } else {
+            by_lines
+        }
+    } else {
+        let truncate_at = PARSE_FAIL_SNIPPET_MAX_CHARS.saturating_sub(PARSE_FAIL_TRUNCATED_SUFFIX.len());
+        let end = by_lines
+            .char_indices()
+            .find(|(i, _)| *i >= truncate_at)
+            .map(|(i, _)| i)
+            .unwrap_or(by_lines.len());
+        let prefix = &by_lines[..end.min(by_lines.len())];
+        format!("{}{}", prefix, PARSE_FAIL_TRUNCATED_SUFFIX)
+    }
+}
+
+/// Parse normalized plan content and return an error with snippet if not canonical or no tasks (SP-7.3).
+///
+/// Single parsing path for normalized output: uses `parse_plan` then treats
+/// "not canonical or 0 tasks" as parse failure with a bounded snippet.
+pub fn parse_plan_or_fail_with_snippet(normalized: &str) -> Result<ParsedPlan, PealError> {
+    let parsed = parse_plan(normalized).map_err(|e| {
+        PealError::NormalizationParseFailed {
+            snippet: format!("parse error: {}", e),
+        }
+    })?;
+    if !is_canonical_plan_format(normalized) || parsed.tasks.is_empty() {
+        return Err(PealError::NormalizationParseFailed {
+            snippet: snippet_for_parse_failure(normalized),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Build argv for the normalization invocation (same layout as Phase 1).
+fn normalization_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        "--print".to_owned(),
+        "--plan".to_owned(),
+        "--workspace".to_owned(),
+        config.repo_path.to_string_lossy().into_owned(),
+        "--output-format".to_owned(),
+        "text".to_owned(),
+    ];
+    let model = config.model.as_deref().unwrap_or("auto");
+    args.push("--model".to_owned());
+    args.push(model.to_owned());
+    args.push(prompt.to_owned());
+    args
 }
 
 /// A single task parsed from the plan file.
@@ -64,6 +229,12 @@ pub fn parse_plan_file(path: &Path) -> anyhow::Result<ParsedPlan> {
         })
         .context(e)
     })?;
+
+    if is_canonical_plan_format(&content) {
+        debug!("canonical plan format detected");
+    } else {
+        debug!("plan format not detected");
+    }
 
     parse_plan(&content)
 }
@@ -200,6 +371,193 @@ pub(crate) fn compute_segments(tasks: &[Task]) -> Vec<Segment> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
+
+    use crate::config::PealConfig;
+
+    /// Minimal PealConfig for testing build_normalize_prompt
+    fn minimal_config_for_normalize(normalize_prompt_path: Option<PathBuf>) -> PealConfig {
+        PealConfig {
+            agent_cmd: "agent".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: PathBuf::from("/repo"),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 5,
+            on_findings_remaining: "fail".to_owned(),
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 1800,
+            phase_retry_count: 0,
+            parallel: false,
+            max_parallel: 4,
+            continue_with_remaining_tasks: false,
+            log_level: None,
+            log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
+            on_stet_fail: "fail".to_owned(),
+            post_run_commands: vec![],
+            post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path,
+        }
+    }
+
+    #[test]
+    fn build_normalize_prompt_none_uses_builtin() {
+        let config = minimal_config_for_normalize(None);
+        let doc = "my document";
+        let prompt = build_normalize_prompt(doc, &config).unwrap();
+        assert_eq!(prompt, prompt::normalize_plan_prompt(doc));
+    }
+
+    #[test]
+    fn build_normalize_prompt_custom_file_replaces_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("prompt.txt");
+        std::fs::write(&prompt_path, "Custom instructions:\n{{DOC}}\nEnd.").unwrap();
+        let config = minimal_config_for_normalize(Some(prompt_path));
+        let doc = "the plan content here";
+        let prompt = build_normalize_prompt(doc, &config).unwrap();
+        assert!(!prompt.contains("{{DOC}}"), "placeholder should be replaced");
+        assert!(prompt.contains("the plan content here"));
+        assert!(prompt.starts_with("Custom instructions:\n"));
+        assert!(prompt.trim_end().ends_with("End."));
+    }
+
+    #[test]
+    fn build_normalize_prompt_custom_file_missing_returns_err() {
+        let config = minimal_config_for_normalize(Some(PathBuf::from("/nonexistent/prompt.txt")));
+        let err = build_normalize_prompt("doc", &config).unwrap_err();
+        match &err {
+            PealError::NormalizePromptFileFailed { path, .. } => {
+                assert!(path.to_string_lossy().contains("nonexistent"));
+            }
+            _ => panic!("expected NormalizePromptFileFailed, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn is_canonical_empty_content_false() {
+        assert!(!is_canonical_plan_format(""));
+    }
+
+    #[test]
+    fn is_canonical_only_preamble_false() {
+        assert!(!is_canonical_plan_format("# Title\n\nText"));
+    }
+
+    #[test]
+    fn is_canonical_task1_body_true() {
+        assert!(is_canonical_plan_format("## Task 1\nBody"));
+    }
+
+    #[test]
+    fn is_canonical_task42_parallel_true() {
+        assert!(is_canonical_plan_format("## Task 42 (parallel)\nBody"));
+    }
+
+    #[test]
+    fn is_canonical_task999_no_newline_true() {
+        assert!(is_canonical_plan_format("## Task 999"));
+    }
+
+    #[test]
+    fn is_canonical_task999_with_trailing_newline_true() {
+        assert!(is_canonical_plan_format("## Task 999\n"));
+    }
+
+    #[test]
+    fn is_canonical_leading_space_false() {
+        assert!(!is_canonical_plan_format("  ## Task 1\nBody"));
+    }
+
+    #[test]
+    fn is_canonical_not_a_task_false() {
+        assert!(!is_canonical_plan_format("## Not a Task 1\nBody"));
+    }
+
+    #[test]
+    fn is_canonical_crlf_and_task1_true() {
+        assert!(is_canonical_plan_format("## Task 1\r\nBody\r\n"));
+    }
+
+    #[test]
+    fn is_canonical_multiple_task_lines_true() {
+        assert!(is_canonical_plan_format(
+            "## Task 1\nA\n\n## Task 2\nB\n\n## Task 3\nC"
+        ));
+    }
+
+    // -- parse_plan_or_fail_with_snippet (SP-7.3) --
+
+    #[test]
+    fn parse_plan_or_fail_empty_returns_err_with_snippet() {
+        let err = parse_plan_or_fail_with_snippet("").unwrap_err();
+        match &err {
+            PealError::NormalizationParseFailed { snippet } => {
+                assert!(snippet.len() <= 500 + 20, "snippet should be bounded");
+            }
+            _ => panic!("expected NormalizationParseFailed, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plan_or_fail_non_canonical_returns_err_with_snippet() {
+        let bad = "Just some text.\nNo ## Task here.";
+        let err = parse_plan_or_fail_with_snippet(bad).unwrap_err();
+        match &err {
+            PealError::NormalizationParseFailed { snippet } => {
+                assert!(snippet.contains("Just some text"), "snippet should show content");
+                assert!(snippet.len() <= 500 + 20, "snippet should be bounded");
+            }
+            _ => panic!("expected NormalizationParseFailed, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plan_or_fail_canonical_returns_ok() {
+        let content = "## Task 1\nDo it.";
+        let plan = parse_plan_or_fail_with_snippet(content).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].index, 1);
+    }
+
+    #[test]
+    fn parse_plan_or_fail_snippet_bounded_long_output() {
+        let long: String = "x\n".repeat(1000);
+        let err = parse_plan_or_fail_with_snippet(&long).unwrap_err();
+        match &err {
+            PealError::NormalizationParseFailed { snippet } => {
+                assert!(
+                    snippet.len() <= 600,
+                    "snippet should be capped (got {} chars)",
+                    snippet.len()
+                );
+                assert!(snippet.contains("... (truncated)") || snippet.lines().count() <= 20);
+            }
+            _ => panic!("expected NormalizationParseFailed, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn detected_content_still_parses_correctly() {
+        let content = "## Task 1\nDo it.\n\n## Task 2 (parallel)\nOther.";
+        assert!(is_canonical_plan_format(content));
+        let plan = parse_plan(content).unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].index, 1);
+        assert_eq!(plan.tasks[1].index, 2);
+        assert!(plan.tasks[1].parallel);
+    }
+
+    // -- parse_plan tests --
 
     #[test]
     fn empty_content_produces_no_tasks() {

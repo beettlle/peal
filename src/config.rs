@@ -17,6 +17,7 @@ const DEFAULT_ON_FINDINGS_REMAINING: &str = "fail";
 const DEFAULT_STATE_DIR: &str = ".peal";
 const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 1800;
 const DEFAULT_PHASE_RETRY_COUNT: u32 = 0;
+const DEFAULT_NORMALIZE_RETRY_COUNT: u32 = 0;
 const DEFAULT_MAX_PARALLEL: u32 = 4;
 const DEFAULT_ON_STET_FAIL: &str = "fail";
 
@@ -88,6 +89,12 @@ pub struct PealConfig {
     pub post_run_commands: Vec<String>,
     /// Timeout in seconds for each post-run command. When None, phase_timeout_sec is used.
     pub post_run_timeout_sec: Option<u64>,
+    /// When true, non-canonical plan files are normalized via Cursor CLI before parsing (SP-7.2).
+    pub normalize_plan: bool,
+    /// Number of retries for normalize+parse when normalized output fails to parse (SP-7.3). Default 0.
+    pub normalize_retry_count: u32,
+    /// Optional path to a file whose content is the full normalization prompt; placeholder `{{DOC}}` is replaced by the plan document. If None, built-in prompt is used.
+    pub normalize_prompt_path: Option<PathBuf>,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -119,6 +126,9 @@ struct FileConfig {
     on_stet_fail: Option<String>,
     post_run_commands: Option<Vec<String>>,
     post_run_timeout_sec: Option<u64>,
+    normalize_plan: Option<bool>,
+    normalize_retry_count: Option<u32>,
+    normalize_prompt_path: Option<PathBuf>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -149,6 +159,9 @@ struct ConfigLayer {
     on_stet_fail: Option<String>,
     post_run_commands: Option<Vec<String>>,
     post_run_timeout_sec: Option<u64>,
+    normalize_plan: Option<bool>,
+    normalize_retry_count: Option<u32>,
+    normalize_prompt_path: Option<PathBuf>,
 }
 
 impl PealConfig {
@@ -273,6 +286,11 @@ impl PealConfig {
             .unwrap_or_else(|| DEFAULT_ON_STET_FAIL.to_owned()),
         post_run_commands: merged.post_run_commands.unwrap_or_default(),
         post_run_timeout_sec: merged.post_run_timeout_sec,
+        normalize_plan: merged.normalize_plan.unwrap_or(false),
+        normalize_retry_count: merged
+            .normalize_retry_count
+            .unwrap_or(DEFAULT_NORMALIZE_RETRY_COUNT),
+        normalize_prompt_path: merged.normalize_prompt_path,
     })
     }
 }
@@ -308,6 +326,9 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         on_stet_fail: fc.on_stet_fail,
         post_run_commands: fc.post_run_commands,
         post_run_timeout_sec: fc.post_run_timeout_sec,
+        normalize_plan: fc.normalize_plan,
+        normalize_retry_count: fc.normalize_retry_count,
+        normalize_prompt_path: fc.normalize_prompt_path,
     })
 }
 
@@ -367,6 +388,9 @@ fn load_env_layer(
         post_run_commands: env_fn("POST_RUN_COMMANDS")
             .map(|s| s.split(',').map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).collect()),
         post_run_timeout_sec: parse_env_u64(env_fn, "POST_RUN_TIMEOUT_SEC")?,
+        normalize_plan: parse_env_bool(env_fn, "NORMALIZE_PLAN")?,
+        normalize_retry_count: parse_env_u32(env_fn, "NORMALIZE_RETRY_COUNT")?,
+        normalize_prompt_path: env_fn("NORMALIZE_PROMPT_PATH").map(PathBuf::from),
     })
 }
 
@@ -497,6 +521,9 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
             .as_deref()
             .map(|s| s.split(',').map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).collect()),
         post_run_timeout_sec: args.post_run_timeout_sec,
+        normalize_plan: if args.normalize { Some(true) } else { None },
+        normalize_retry_count: args.normalize_retry_count,
+        normalize_prompt_path: None,
     }
 }
 
@@ -567,6 +594,15 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .post_run_timeout_sec
             .or(env.post_run_timeout_sec)
             .or(file.post_run_timeout_sec),
+        normalize_plan: cli.normalize_plan.or(env.normalize_plan).or(file.normalize_plan),
+        normalize_retry_count: cli
+            .normalize_retry_count
+            .or(env.normalize_retry_count)
+            .or(file.normalize_retry_count),
+        normalize_prompt_path: cli
+            .normalize_prompt_path
+            .or(env.normalize_prompt_path)
+            .or(file.normalize_prompt_path),
     }
 }
 
@@ -582,6 +618,8 @@ mod tests {
         RunArgs {
             plan,
             repo,
+            normalize: false,
+            normalize_retry_count: None,
             config: None,
             agent_cmd: None,
             model: None,
@@ -773,6 +811,8 @@ model = "from-file"
         let args = RunArgs {
             plan: Some(PathBuf::from("cli-plan.md")),
             repo: None,
+            normalize: false,
+            normalize_retry_count: None,
             config: None,
             agent_cmd: None,
             model: Some("from-cli".to_owned()),
@@ -846,6 +886,8 @@ agent_cmd = "from-file"
         let args = RunArgs {
             plan: Some(PathBuf::from("p.md")),
             repo: Some(PathBuf::from("/r")),
+            normalize: false,
+            normalize_retry_count: None,
             config: None,
             agent_cmd: Some("from-cli".to_owned()),
             model: None,
@@ -944,6 +986,7 @@ bogus_key = true
         let args = RunArgs {
             plan: Some(PathBuf::from("p.md")),
             repo: Some(PathBuf::from("/r")),
+            normalize: false,
             config: None,
             agent_cmd: None,
             model: None,
@@ -1148,6 +1191,8 @@ sandbox = "file-sandbox"
         let args = RunArgs {
             plan: None,
             repo: None,
+            normalize: false,
+            normalize_retry_count: None,
             config: None,
             agent_cmd: Some("from-cli".to_owned()),
             model: None,
@@ -1377,6 +1422,172 @@ post_run_timeout_sec = 60
 
         assert!(cfg.post_run_commands.is_empty());
         assert_eq!(cfg.post_run_timeout_sec, None);
+    }
+
+    #[test]
+    fn normalize_plan_defaults_to_false() {
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert!(!cfg.normalize_plan);
+    }
+
+    #[test]
+    fn normalize_plan_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+normalize_plan = true
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert!(cfg.normalize_plan);
+    }
+
+    #[test]
+    fn normalize_plan_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "NORMALIZE_PLAN" {
+                Some("true".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert!(cfg.normalize_plan);
+    }
+
+    #[test]
+    fn normalize_plan_from_cli() {
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.normalize = true;
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert!(cfg.normalize_plan);
+    }
+
+    #[test]
+    fn normalize_plan_cli_overrides_env_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+normalize_plan = true
+"#,
+        )
+        .unwrap();
+
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "NORMALIZE_PLAN" {
+                Some("false".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let mut args = minimal_cli_args(None, None);
+        args.plan = Some(PathBuf::from("p.md"));
+        args.repo = Some(PathBuf::from("/r"));
+        args.normalize = true;
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
+        assert!(cfg.normalize_plan, "CLI --normalize wins over env and file");
+    }
+
+    #[test]
+    fn normalize_retry_count_defaults_to_zero() {
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert_eq!(cfg.normalize_retry_count, 0);
+    }
+
+    #[test]
+    fn normalize_retry_count_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+normalize_retry_count = 2
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert_eq!(cfg.normalize_retry_count, 2);
+    }
+
+    #[test]
+    fn normalize_retry_count_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "NORMALIZE_RETRY_COUNT" {
+                Some("3".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert_eq!(cfg.normalize_retry_count, 3);
+    }
+
+    #[test]
+    fn normalize_prompt_path_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("custom-prompt.txt");
+        fs::write(&prompt_path, "Convert: {{DOC}}").unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                r#"
+plan_path = "p.md"
+repo_path = "/r"
+normalize_prompt_path = "{}"
+"#,
+                prompt_path.display()
+            ),
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert_eq!(cfg.normalize_prompt_path.as_deref(), Some(prompt_path.as_path()));
+    }
+
+    #[test]
+    fn normalize_prompt_path_from_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("env-prompt.txt");
+        fs::write(&prompt_path, "{{DOC}}").unwrap();
+
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "NORMALIZE_PROMPT_PATH" {
+                Some(std::path::Path::new("/tmp/custom-prompt.txt").display().to_string())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert_eq!(
+            cfg.normalize_prompt_path.as_deref(),
+            Some(std::path::Path::new("/tmp/custom-prompt.txt"))
+        );
     }
 
     #[test]

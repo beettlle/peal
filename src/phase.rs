@@ -378,6 +378,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         }
     }
 
@@ -598,6 +601,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -659,6 +665,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -698,6 +707,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let sleep_path = crate::cursor::resolve_agent_cmd("sleep").expect("sleep must exist");
@@ -746,6 +758,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -790,6 +805,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -846,6 +864,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -885,6 +906,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -995,6 +1019,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -1053,6 +1080,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1092,6 +1122,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -1134,6 +1167,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -1192,6 +1228,9 @@ mod tests {
             on_stet_fail: "fail".to_owned(),
             post_run_commands: vec![],
             post_run_timeout_sec: None,
+            normalize_plan: false,
+            normalize_retry_count: 0,
+            normalize_prompt_path: None,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
