@@ -242,6 +242,8 @@ mod tests {
             dir.path().to_str().unwrap(),
             "--agent-cmd",
             "echo",
+            "--stet-path",
+            "/nonexistent",
         ])
         .unwrap();
 
@@ -266,7 +268,7 @@ mod tests {
         .unwrap();
 
         let cli =
-            Cli::try_parse_from(["peal", "run", "--config", cfg_path.to_str().unwrap()]).unwrap();
+            Cli::try_parse_from(["peal", "run", "--config", cfg_path.to_str().unwrap(), "--stet-path", "/nonexistent"]).unwrap();
 
         run(cli).expect("should succeed when plan and repo come from config file");
     }
@@ -294,6 +296,8 @@ mod tests {
             dir.path().join(".peal").to_str().unwrap(),
             "--task",
             "2",
+            "--stet-path",
+            "/nonexistent",
         ])
         .unwrap();
 
@@ -332,6 +336,8 @@ mod tests {
             dir.path().join(".peal").to_str().unwrap(),
             "--from-task",
             "2",
+            "--stet-path",
+            "/nonexistent",
         ])
         .unwrap();
 

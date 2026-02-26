@@ -1345,7 +1345,7 @@ mod tests {
     fn scheduled_fail_fast_in_parallel_block_saves_prior() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join(".peal");
-        let echo = resolve_echo();
+        let _echo = resolve_echo();
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
 
         // Task 1 runs with echo (succeeds), then task 2 in the parallel block

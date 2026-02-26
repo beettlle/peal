@@ -56,11 +56,15 @@ pub enum PealError {
     #[error("stet finish failed: {detail}")]
     StetFinishFailed { detail: String },
 
-    #[error("Task {task_index}: {remaining_count} stet findings remain after {rounds} address round(s)")]
+    #[error(
+        "Task {task_index}: {remaining_count} stet findings remain after {rounds} address round(s)\ncommit: {commit_hash}\nstet review:\n{stet_review}"
+    )]
     StetFindingsRemain {
         task_index: u32,
         rounds: u32,
         remaining_count: usize,
+        commit_hash: String,
+        stet_review: String,
     },
 
     #[error("Invalid on_findings_remaining value '{value}' (expected \"fail\" or \"warn\")")]

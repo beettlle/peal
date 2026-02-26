@@ -10,7 +10,7 @@ use crate::cli::RunArgs;
 
 const DEFAULT_AGENT_CMD: &str = "agent";
 const DEFAULT_SANDBOX: &str = "disabled";
-const DEFAULT_MAX_ADDRESS_ROUNDS: u32 = 3;
+const DEFAULT_MAX_ADDRESS_ROUNDS: u32 = 5;
 const DEFAULT_ON_FINDINGS_REMAINING: &str = "fail";
 const DEFAULT_STATE_DIR: &str = ".peal";
 const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 1800;
@@ -384,7 +384,7 @@ mod tests {
         assert!(cfg.stet_commands.is_empty());
         assert_eq!(cfg.sandbox, "disabled");
         assert_eq!(cfg.model, None);
-        assert_eq!(cfg.max_address_rounds, 3);
+        assert_eq!(cfg.max_address_rounds, 5);
         assert_eq!(cfg.on_findings_remaining, "fail");
         assert_eq!(cfg.state_dir, PathBuf::from(".peal"));
         assert_eq!(cfg.phase_timeout_sec, 1800);
@@ -748,7 +748,7 @@ repo_path = "/r"
 
         assert_eq!(cfg.agent_cmd, "agent");
         assert_eq!(cfg.sandbox, "disabled");
-        assert_eq!(cfg.max_address_rounds, 3);
+        assert_eq!(cfg.max_address_rounds, 5);
         assert_eq!(cfg.on_findings_remaining, "fail");
         assert_eq!(cfg.phase_timeout_sec, 1800);
         assert!(!cfg.parallel);

@@ -5,6 +5,7 @@
 //! it simply means Phase 3 will be skipped.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -319,9 +320,29 @@ pub struct AddressLoopOutcome {
     pub last_stet_result: StetRunResult,
 }
 
+/// Best-effort resolve current HEAD commit hash in the repo. Returns "unknown" on any failure.
+fn resolve_head_commit(repo_path: &Path) -> String {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return "unknown".to_owned(),
+    };
+    let s = String::from_utf8_lossy(&output.stdout);
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        "unknown".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// Drive the address → re-run → check loop for a single task.
 ///
-/// Bounded by `config.max_address_rounds` (default 3). Returns early
+/// Bounded by `config.max_address_rounds` (default 5). Returns early
 /// when findings are resolved. After exhausting all rounds, behavior is
 /// controlled by `config.on_findings_remaining` (`"fail"` or `"warn"`).
 pub fn address_loop(
@@ -388,6 +409,11 @@ pub fn address_loop(
         task_index,
         rounds: config.max_address_rounds,
         remaining_count: count_findings(&current_result.stdout),
+        commit_hash: resolve_head_commit(&config.repo_path),
+        stet_review: format!(
+            "stdout:\n{}\nstderr:\n{}",
+            current_result.stdout, current_result.stderr
+        ),
     })
 }
 
@@ -429,6 +455,16 @@ pub fn address_findings(
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    /// Returns path to a script that prints cwd and ignores argv (for cwd tests on Unix).
+    #[cfg(unix)]
+    fn pwd_script_ignoring_args(dir: &tempfile::TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.path().join("stet_pwd.sh");
+        std::fs::write(&script, "#!/bin/sh\npwd\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
 
     #[test]
     fn returns_none_when_not_on_path() {
@@ -638,13 +674,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn start_session_uses_repo_as_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let pwd_path =
-            crate::cursor::resolve_agent_cmd("pwd").expect("pwd must exist");
+        let pwd_script = pwd_script_ignoring_args(&dir);
 
-        let out = start_session(&pwd_path, None, dir.path(), Some(Duration::from_secs(10)))
+        let out = start_session(&pwd_script, None, dir.path(), Some(Duration::from_secs(10)))
             .unwrap();
 
         let expected = dir.path().canonicalize().unwrap();
@@ -814,13 +850,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_review_uses_repo_as_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let pwd_path =
-            crate::cursor::resolve_agent_cmd("pwd").expect("pwd must exist");
+        let pwd_script = pwd_script_ignoring_args(&dir);
 
-        let result = run_review(&pwd_path, dir.path(), Some(Duration::from_secs(10))).unwrap();
+        let result = run_review(&pwd_script, dir.path(), Some(Duration::from_secs(10))).unwrap();
 
         let expected = dir.path().canonicalize().unwrap();
         let actual: PathBuf = result.stdout.trim().into();
@@ -1064,8 +1100,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn address_loop_resolves_in_one_round() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
 
         // Agent stub: does nothing successfully.
@@ -1220,13 +1254,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn finish_session_uses_repo_as_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let pwd_path =
-            crate::cursor::resolve_agent_cmd("pwd").expect("pwd must exist");
+        let pwd_script = pwd_script_ignoring_args(&dir);
 
-        let out = finish_session(&pwd_path, dir.path(), Some(Duration::from_secs(10)))
+        let out = finish_session(&pwd_script, dir.path(), Some(Duration::from_secs(10)))
             .unwrap();
 
         let expected = dir.path().canonicalize().unwrap();
