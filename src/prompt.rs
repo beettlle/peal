@@ -37,6 +37,17 @@ const STET_DELIMITER: &str = "---STET---";
 /// Delimiter used to fence extracted suggestions inside the Phase 3 prompt.
 const SUGGESTIONS_DELIMITER: &str = "---SUGGESTIONS---";
 
+/// Build the triage prompt: stet output plus the single question "Anything to address from this review?"
+/// Used by Phase 3 auto-dismiss to let the LLM decide which findings to dismiss.
+pub fn triage_prompt(stet_output: &str) -> String {
+    format!(
+        "{STET_DELIMITER}\n\
+         {stet_output}\n\
+         {STET_DELIMITER}\n\n\
+         Anything to address from this review?"
+    )
+}
+
 /// Build the Phase 1 (plan) prompt for a given task.
 ///
 /// The task content is wrapped in `---TASK---` delimiters so the agent

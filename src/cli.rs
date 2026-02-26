@@ -121,6 +121,10 @@ pub struct RunArgs {
     /// Peal always passes `--output=json` for run.
     #[arg(long)]
     pub stet_run_args: Option<String>,
+
+    /// Disable LLM triage for stet findings; use rule-based dismiss patterns only.
+    #[arg(long)]
+    pub stet_disable_llm_triage: Option<bool>,
 }
 
 #[cfg(test)]

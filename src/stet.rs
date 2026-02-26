@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::config::PealConfig;
+use crate::config::{PealConfig, StetDismissPattern, STET_DISMISS_REASONS};
 use crate::cursor::is_executable;
 use crate::error::PealError;
 use crate::phase::{self, PhaseOutput};
@@ -308,6 +308,252 @@ pub fn detect_findings(exit_code: Option<i32>, stdout: &str) -> bool {
     !trimmed.is_empty()
 }
 
+/// One finding parsed from stet run JSON (for triage and dismiss).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFinding {
+    pub id: String,
+    pub message: String,
+    pub suggestion: Option<String>,
+    pub path: Option<String>,
+}
+
+/// Parse stet run JSON stdout into a list of findings with id, message, suggestion, path.
+/// Supports `{"findings": [...]}` or top-level array. Returns None if not JSON or no findings array.
+pub fn parse_findings_from_run_json(stdout: &str) -> Option<Vec<ParsedFinding>> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let items = match &value {
+        serde_json::Value::Object(map) => map.get("findings")?.as_array()?,
+        serde_json::Value::Array(arr) => arr,
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let obj = item.as_object()?;
+        let id = obj.get("id")?.as_str()?.to_owned();
+        let message = obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let suggestion = obj.get("suggestion").and_then(|v| v.as_str()).map(String::from);
+        let path = obj
+            .get("path")
+            .or_else(|| obj.get("file"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        out.push(ParsedFinding {
+            id,
+            message,
+            suggestion,
+            path,
+        });
+    }
+    Some(out)
+}
+
+/// Run `stet dismiss <id> <reason>` in the repo. Best-effort: on failure log and continue.
+pub(crate) fn dismiss_finding(
+    stet_path: &Path,
+    repo_path: &Path,
+    id: &str,
+    reason: &str,
+    timeout: Option<Duration>,
+) {
+    let stet_str = stet_path.to_string_lossy();
+    let args = ["dismiss".to_owned(), id.to_owned(), reason.to_owned()];
+    info!(
+        stet = %stet_str,
+        id,
+        reason,
+        "invoking stet dismiss"
+    );
+    match subprocess::run_command(&stet_str, &args, repo_path, timeout) {
+        Ok(result) => {
+            if !result.success() {
+                warn!(
+                    id,
+                    reason,
+                    exit_code = ?result.exit_code,
+                    "stet dismiss failed; continuing"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(id, reason, err = %e, "stet dismiss spawn failed; continuing");
+        }
+    }
+}
+
+/// Result of parsing the triage agent response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TriageResult {
+    /// Dismiss all findings with the given reason.
+    DismissAll(String),
+    /// Only these ids should be addressed; dismiss the rest with default reason.
+    DismissRest { to_address: Vec<String> },
+    /// Unparseable or ambiguous; dismiss none.
+    DismissNone,
+}
+
+/// Default reason when the model says "nothing to address" or we dismiss all without a specific reason.
+const DEFAULT_DISMISS_REASON: &str = "false_positive";
+
+/// Parse free-form triage response into a list of (id, reason) to dismiss.
+/// - "Nothing to address" / "No" / "All false positives" etc. -> dismiss all.
+/// - "Fix finding X" / "Only Y needs address" -> dismiss rest (ids not in to_address).
+/// - Unparseable -> dismiss none.
+pub(crate) fn parse_triage_response(response: &str, findings: &[ParsedFinding]) -> TriageResult {
+    let lower = response.trim().to_lowercase();
+    if lower.is_empty() {
+        return TriageResult::DismissNone;
+    }
+
+    // Nothing to address -> dismiss all.
+    let nothing_phrases = [
+        "nothing to address",
+        "no, nothing",
+        "no nothing",
+        "nothing to fix",
+        "all false positive",
+        "all false positives",
+        "no findings to address",
+        "no issues to address",
+    ];
+    if nothing_phrases
+        .iter()
+        .any(|p| lower.contains(p))
+    {
+        return TriageResult::DismissAll(DEFAULT_DISMISS_REASON.to_owned());
+    }
+    let first_line = lower.lines().next().unwrap_or("").trim();
+    if (first_line == "no" || first_line == "no." || first_line == "nope") && lower.len() < 20 {
+        return TriageResult::DismissAll(DEFAULT_DISMISS_REASON.to_owned());
+    }
+
+    // Look for finding ids mentioned in the response as "to address" / "to fix".
+    let mut to_address = Vec::new();
+    for f in findings {
+        if lower.contains(&f.id.to_lowercase()) {
+            let before = lower.find(&f.id.to_lowercase()).unwrap_or(0);
+            let snippet = lower.get(before.saturating_sub(30)..(before + f.id.len() + 50).min(lower.len())).unwrap_or("");
+            if snippet.contains("fix") || snippet.contains("address") || snippet.contains("need") {
+                to_address.push(f.id.clone());
+            }
+        }
+    }
+
+    if !to_address.is_empty() && to_address.len() < findings.len() {
+        return TriageResult::DismissRest { to_address };
+    }
+
+    if to_address.len() == findings.len() {
+        return TriageResult::DismissNone;
+    }
+
+    TriageResult::DismissNone
+}
+
+/// Apply rule-based patterns to decide which findings to dismiss. Returns (id, reason) for each match.
+pub(crate) fn triage_by_patterns(
+    findings: &[ParsedFinding],
+    patterns: &[StetDismissPattern],
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for f in findings {
+        let text = format!(
+            "{} {}",
+            f.message,
+            f.path.as_deref().unwrap_or("")
+        );
+        for p in patterns {
+            if text.contains(&p.pattern) {
+                out.push((f.id.clone(), p.reason.clone()));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Dismiss non-actionable findings and re-run stet. Returns the new run result.
+pub fn dismiss_non_actionable_and_rerun(
+    stet_path: &Path,
+    agent_path: &Path,
+    config: &PealConfig,
+    run_stdout: &str,
+) -> Result<StetRunResult, PealError> {
+    let findings = match parse_findings_from_run_json(run_stdout) {
+        Some(f) if !f.is_empty() => f,
+        _ => {
+            return run_review(
+                stet_path,
+                &config.repo_path,
+                &config.stet_run_extra_args,
+                Some(Duration::from_secs(config.phase_timeout_sec)),
+            );
+        }
+    };
+
+    let to_dismiss: Vec<(String, String)> = if config.stet_disable_llm_triage {
+        triage_by_patterns(&findings, &config.stet_dismiss_patterns)
+    } else {
+        match phase::run_phase3_triage(agent_path, config, run_stdout) {
+            Ok(output) => {
+                let triage = parse_triage_response(&output.stdout, &findings);
+                match triage {
+                    TriageResult::DismissAll(reason) => findings
+                        .iter()
+                        .map(|f| (f.id.clone(), reason.clone()))
+                        .collect(),
+                    TriageResult::DismissRest { to_address } => {
+                        let to_address_set: std::collections::HashSet<_> =
+                            to_address.into_iter().collect();
+                        findings
+                            .iter()
+                            .filter(|f| !to_address_set.contains(&f.id))
+                            .map(|f| (f.id.clone(), DEFAULT_DISMISS_REASON.to_owned()))
+                            .collect()
+                    }
+                    TriageResult::DismissNone => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+
+    let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+    for (id, reason) in &to_dismiss {
+        let reason = normalize_dismiss_reason(reason);
+        if STET_DISMISS_REASONS.contains(&reason.as_str()) {
+            dismiss_finding(stet_path, &config.repo_path, id, &reason, timeout);
+        }
+    }
+
+    run_review(
+        stet_path,
+        &config.repo_path,
+        &config.stet_run_extra_args,
+        timeout,
+    )
+}
+
+fn normalize_dismiss_reason(s: &str) -> String {
+    let t = s.trim().to_lowercase();
+    if t == "false_positive" || t == "false positive" {
+        return "false_positive".to_owned();
+    }
+    if t == "already_correct" || t == "already correct" {
+        return "already_correct".to_owned();
+    }
+    if t == "wrong_suggestion" || t == "wrong suggestion" {
+        return "wrong_suggestion".to_owned();
+    }
+    if t == "out_of_scope" || t == "out of scope" {
+        return "out_of_scope".to_owned();
+    }
+    DEFAULT_DISMISS_REASON.to_owned()
+}
+
 /// Extract `suggestion` fields from stet JSON output.
 ///
 /// Supports two shapes:
@@ -394,6 +640,23 @@ pub fn address_loop(
             max_rounds = config.max_address_rounds,
             "address loop: starting round"
         );
+
+        let after_dismiss = dismiss_non_actionable_and_rerun(
+            stet_path,
+            agent_path,
+            config,
+            &current_result.stdout,
+        )?;
+        current_result = after_dismiss;
+
+        if !current_result.has_findings {
+            info!(task_index, round, "address loop: findings resolved after dismiss pass");
+            return Ok(AddressLoopOutcome {
+                rounds_used: round,
+                findings_resolved: true,
+                last_stet_result: current_result,
+            });
+        }
 
         address_findings(agent_path, config, task_index, &current_result)?;
 
@@ -834,6 +1097,267 @@ mod tests {
         assert!(!detect_findings(Some(0), stdout));
     }
 
+    // -- parse_findings_from_run_json tests --
+
+    #[test]
+    fn parse_findings_from_run_json_object_with_findings() {
+        let stdout = r#"{"findings": [{"id": "a1", "message": "unused var", "suggestion": "remove it"}]}"#;
+        let out = parse_findings_from_run_json(stdout).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "a1");
+        assert_eq!(out[0].message, "unused var");
+        assert_eq!(out[0].suggestion.as_deref(), Some("remove it"));
+        assert_eq!(out[0].path, None);
+    }
+
+    #[test]
+    fn parse_findings_from_run_json_top_level_array() {
+        let stdout = r#"[{"id": "f1"}, {"id": "f2", "message": "msg2"}]"#;
+        let out = parse_findings_from_run_json(stdout).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "f1");
+        assert_eq!(out[0].message, "");
+        assert_eq!(out[1].id, "f2");
+        assert_eq!(out[1].message, "msg2");
+    }
+
+    #[test]
+    fn parse_findings_from_run_json_empty_array() {
+        let stdout = r#"{"findings": []}"#;
+        let out = parse_findings_from_run_json(stdout).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_findings_from_run_json_none_for_non_json() {
+        assert_eq!(parse_findings_from_run_json("not json"), None);
+    }
+
+    #[test]
+    fn parse_findings_from_run_json_none_for_malformed() {
+        assert_eq!(parse_findings_from_run_json(r#"{"findings": [}"#), None);
+    }
+
+    #[test]
+    fn parse_findings_from_run_json_includes_path_when_present() {
+        let stdout = r#"{"findings": [{"id": "x", "message": "m", "path": "src/lib.rs"}]}"#;
+        let out = parse_findings_from_run_json(stdout).unwrap();
+        assert_eq!(out[0].path.as_deref(), Some("src/lib.rs"));
+    }
+
+    // -- parse_triage_response tests --
+
+    #[test]
+    fn parse_triage_nothing_to_address_dismiss_all() {
+        let findings = vec![
+            ParsedFinding { id: "f1".into(), message: "m1".into(), suggestion: None, path: None },
+            ParsedFinding { id: "f2".into(), message: "m2".into(), suggestion: None, path: None },
+        ];
+        let r = parse_triage_response("No, nothing to address from this review.", &findings);
+        match &r {
+            TriageResult::DismissAll(reason) => assert_eq!(reason, "false_positive"),
+            _ => panic!("expected DismissAll"),
+        }
+    }
+
+    #[test]
+    fn parse_triage_nothing_to_address_variants() {
+        let findings = vec![ParsedFinding { id: "f1".into(), message: "m".into(), suggestion: None, path: None }];
+        for response in ["Nothing to address", "All false positives", "No findings to address.", "No."] {
+            let r = parse_triage_response(response, &findings);
+            assert!(matches!(r, TriageResult::DismissAll(_)), "response {:?}", response);
+        }
+    }
+
+    #[test]
+    fn parse_triage_fix_finding_abc_dismiss_rest() {
+        let findings = vec![
+            ParsedFinding { id: "abc123".into(), message: "fix this".into(), suggestion: None, path: None },
+            ParsedFinding { id: "def456".into(), message: "noise".into(), suggestion: None, path: None },
+        ];
+        // Avoid "fix" near def456 (e.g. "false") so only abc123 is to_address.
+        let r = parse_triage_response("Only finding abc123 needs a fix. The rest are noise.", &findings);
+        match &r {
+            TriageResult::DismissRest { to_address } => {
+                assert_eq!(to_address.len(), 1);
+                assert_eq!(to_address[0], "abc123");
+            }
+            _ => panic!("expected DismissRest"),
+        }
+    }
+
+    #[test]
+    fn parse_triage_unparseable_dismiss_none() {
+        let findings = vec![ParsedFinding { id: "f1".into(), message: "m".into(), suggestion: None, path: None }];
+        assert!(matches!(parse_triage_response("", &findings), TriageResult::DismissNone));
+        assert!(matches!(parse_triage_response("   \n  ", &findings), TriageResult::DismissNone));
+        assert!(matches!(parse_triage_response("maybe fix something", &findings), TriageResult::DismissNone));
+    }
+
+    // -- triage_by_patterns tests --
+
+    #[test]
+    fn triage_by_patterns_empty_patterns_nothing_dismissed() {
+        let findings = vec![ParsedFinding { id: "f1".into(), message: "unused".into(), suggestion: None, path: None }];
+        let out = triage_by_patterns(&findings, &[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn triage_by_patterns_match_message_one_dismissed() {
+        let findings = vec![
+            ParsedFinding { id: "f1".into(), message: "unused variable".into(), suggestion: None, path: None },
+            ParsedFinding { id: "f2".into(), message: "other".into(), suggestion: None, path: None },
+        ];
+        let patterns = vec![StetDismissPattern { pattern: "unused".to_string(), reason: "false_positive".to_string() }];
+        let out = triage_by_patterns(&findings, &patterns);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "f1");
+        assert_eq!(out[0].1, "false_positive");
+    }
+
+    /// Mock stet that records argv and cwd to capture.txt in repo_path; used to verify dismiss_finding calls.
+    #[cfg(unix)]
+    fn mock_stet_dismiss_capture_script(dir: &tempfile::TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.path().join("stet_dismiss.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"argv: $@\" >> capture.txt\necho \"cwd: $(pwd)\" >> capture.txt\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dismiss_finding_invokes_stet_with_args_and_repo_cwd() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let script = mock_stet_dismiss_capture_script(&dir);
+        let repo_path = dir.path().to_path_buf();
+        dismiss_finding(
+            &script,
+            &repo_path,
+            "my-id",
+            "false_positive",
+            Some(Duration::from_secs(5)),
+        );
+        let capture = std::fs::read_to_string(dir.path().join("capture.txt")).unwrap();
+        assert!(capture.contains("dismiss"), "expected dismiss in argv: {}", capture);
+        assert!(capture.contains("my-id"), "expected my-id in argv: {}", capture);
+        assert!(capture.contains("false_positive"), "expected false_positive in argv: {}", capture);
+        assert!(
+            capture.contains(repo_path.to_string_lossy().as_ref()),
+            "expected repo cwd in capture: {}",
+            capture
+        );
+    }
+
+    /// Stet stub: on "run" prints empty findings JSON; on "dismiss" exits 0.
+    #[cfg(unix)]
+    fn stet_stub_empty_on_run(dir: &tempfile::TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.path().join("stet_stub.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+[ "$1" = "run" ] && printf '%s\n' '{"findings":[]}'
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Agent stub that prints "Nothing to address from this review." for LLM triage tests.
+    #[cfg(unix)]
+    fn agent_stub_nothing_to_address(dir: &tempfile::TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.path().join("agent_triage.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' "Nothing to address from this review."
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dismiss_non_actionable_and_rerun_llm_nothing_to_address_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let stet_path = stet_stub_empty_on_run(&dir);
+        let agent_path = agent_stub_nothing_to_address(&dir);
+        let config = crate::config::PealConfig {
+            agent_cmd: agent_path.to_string_lossy().to_string(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
+        };
+        let run_stdout = r#"{"findings":[{"id":"f1","message":"unused"}]}"#;
+        let result = dismiss_non_actionable_and_rerun(&stet_path, &agent_path, &config, run_stdout).unwrap();
+        assert!(!result.has_findings, "expected no findings after dismiss-all and rerun");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dismiss_non_actionable_and_rerun_rule_pattern_dismisses_then_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let stet_path = stet_stub_empty_on_run(&dir);
+        let agent_path = agent_stub_nothing_to_address(&dir); // not used when LLM triage disabled
+        let config = crate::config::PealConfig {
+            agent_cmd: "true".to_owned(),
+            plan_path: PathBuf::from("plan.md"),
+            repo_path: dir.path().to_path_buf(),
+            stet_commands: vec![],
+            sandbox: "disabled".to_owned(),
+            model: None,
+            max_address_rounds: 3,
+            on_findings_remaining: "fail".to_owned(),
+            state_dir: PathBuf::from(".peal"),
+            phase_timeout_sec: 30,
+            parallel: false,
+            max_parallel: 4,
+            log_level: None,
+            log_file: None,
+            stet_path: None,
+            stet_start_ref: None,
+            stet_start_extra_args: vec![],
+            stet_run_extra_args: vec![],
+            stet_disable_llm_triage: true,
+            stet_dismiss_patterns: vec![crate::config::StetDismissPattern {
+                pattern: "unused".to_string(),
+                reason: "false_positive".to_string(),
+            }],
+        };
+        let run_stdout = r#"{"findings":[{"id":"f1","message":"unused variable"}]}"#;
+        let result = dismiss_non_actionable_and_rerun(&stet_path, &agent_path, &config, run_stdout).unwrap();
+        assert!(!result.has_findings, "expected no findings after pattern-dismiss and rerun");
+    }
+
     // -- run_review integration tests --
 
     #[test]
@@ -1008,6 +1532,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let stet_result = StetRunResult {
@@ -1065,6 +1591,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let stet_result = StetRunResult {
@@ -1144,6 +1672,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let initial = StetRunResult {
@@ -1191,6 +1721,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let initial = StetRunResult {
@@ -1236,6 +1768,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let initial = StetRunResult {
@@ -1362,6 +1896,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let initial = StetRunResult {

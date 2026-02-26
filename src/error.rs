@@ -69,4 +69,7 @@ pub enum PealError {
 
     #[error("Invalid on_findings_remaining value '{value}' (expected \"fail\" or \"warn\")")]
     InvalidOnFindingsRemaining { value: String },
+
+    #[error("Invalid stet_dismiss_patterns reason '{value}' (expected one of: false_positive, already_correct, wrong_suggestion, out_of_scope)")]
+    InvalidStetDismissReason { value: String },
 }

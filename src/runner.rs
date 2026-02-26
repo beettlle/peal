@@ -410,6 +410,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         }
     }
 
@@ -505,6 +507,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -669,6 +673,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -845,6 +851,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let mut state = fresh_state();
@@ -1384,6 +1392,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let mut state = fresh_state();

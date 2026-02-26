@@ -200,6 +200,54 @@ pub fn run_phase3(
     })
 }
 
+/// Run the triage step: send stet output to the agent with "Anything to address from this review?"
+/// Same argv and timeout as Phase 3. Used by Phase 3 auto-dismiss to get a free-form triage response.
+pub fn run_phase3_triage(
+    agent_path: &Path,
+    config: &PealConfig,
+    stet_output: &str,
+) -> Result<PhaseOutput, PealError> {
+    let prompt = prompt::triage_prompt(stet_output);
+    let args = phase3_argv(config, &prompt);
+    let timeout = Duration::from_secs(config.phase_timeout_sec);
+    let agent_str = agent_path.to_string_lossy();
+
+    info!(
+        agent = %agent_str,
+        timeout_sec = config.phase_timeout_sec,
+        "invoking phase 3 triage"
+    );
+
+    let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
+        .map_err(|e| PealError::PhaseSpawnFailed {
+            phase: 3,
+            detail: e.to_string(),
+        })?;
+
+    if result.timed_out {
+        warn!("phase 3 triage timed out");
+        return Err(PealError::PhaseTimedOut {
+            phase: 3,
+            timeout_sec: config.phase_timeout_sec,
+        });
+    }
+    if !result.success() {
+        warn!(
+            exit_code = ?result.exit_code,
+            "phase 3 triage exited with non-zero code; treating as unparseable"
+        );
+        return Ok(PhaseOutput {
+            stdout: String::new(),
+            stderr: result.stderr,
+        });
+    }
+
+    Ok(PhaseOutput {
+        stdout: result.stdout,
+        stderr: result.stderr,
+    })
+}
+
 /// Build the argv for a Phase 3 invocation (same layout as Phase 2).
 fn phase3_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
     let mut args = vec![
@@ -275,6 +323,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         }
     }
 
@@ -485,6 +535,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -540,6 +592,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -574,6 +628,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let sleep_path = crate::cursor::resolve_agent_cmd("sleep").expect("sleep must exist");
@@ -616,6 +672,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -654,6 +712,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -704,6 +764,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -737,6 +799,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -839,6 +903,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -891,6 +957,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -924,6 +992,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -960,6 +1030,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -1012,6 +1084,8 @@ mod tests {
             stet_start_ref: None,
             stet_start_extra_args: vec![],
             stet_run_extra_args: vec![],
+            stet_disable_llm_triage: false,
+            stet_dismiss_patterns: vec![],
         };
 
         let echo_path = PathBuf::from("/bin/echo");

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::cli::RunArgs;
+use crate::error::PealError;
 
 // Precedence: CLI > env > file > defaults.
 
@@ -15,6 +16,28 @@ const DEFAULT_ON_FINDINGS_REMAINING: &str = "fail";
 const DEFAULT_STATE_DIR: &str = ".peal";
 const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 1800;
 const DEFAULT_MAX_PARALLEL: u32 = 4;
+
+/// Valid dismiss reasons for stet (must match `stet dismiss <id> <reason>`).
+pub const STET_DISMISS_REASONS: [&str; 4] = [
+    "false_positive",
+    "already_correct",
+    "wrong_suggestion",
+    "out_of_scope",
+];
+
+/// One pattern to match finding message/path; when matched, dismiss with the given reason.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct StetDismissPattern {
+    pub pattern: String,
+    pub reason: String,
+}
+
+impl StetDismissPattern {
+    /// Returns true if `reason` is one of the four allowed values.
+    pub fn is_valid_reason(reason: &str) -> bool {
+        STET_DISMISS_REASONS.contains(&reason)
+    }
+}
 
 const ENV_PREFIX: &str = "PEAL_";
 
@@ -44,6 +67,12 @@ pub struct PealConfig {
     /// Extra arguments passed through to `stet run` (e.g. `--verify`, `--context 256k`).
     /// Peal always adds `--output=json` for run; these are appended so user flags are supported.
     pub stet_run_extra_args: Vec<String>,
+    /// When true, do not call the agent to triage findings; use rule-based stet_dismiss_patterns only.
+    /// Default false: use LLM with "Anything to address from this review?" to decide what to dismiss.
+    pub stet_disable_llm_triage: bool,
+    /// When LLM triage is disabled, match finding message/path against these patterns; if match, dismiss with reason.
+    /// Empty when LLM triage is enabled or not configured.
+    pub stet_dismiss_patterns: Vec<StetDismissPattern>,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -68,6 +97,8 @@ struct FileConfig {
     stet_start_ref: Option<String>,
     stet_start_extra_args: Option<Vec<String>>,
     stet_run_extra_args: Option<Vec<String>>,
+    stet_disable_llm_triage: Option<bool>,
+    stet_dismiss_patterns: Option<Vec<StetDismissPattern>>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -91,6 +122,8 @@ struct ConfigLayer {
     stet_start_ref: Option<String>,
     stet_start_extra_args: Option<Vec<String>>,
     stet_run_extra_args: Option<Vec<String>>,
+    stet_disable_llm_triage: Option<bool>,
+    stet_dismiss_patterns: Option<Vec<StetDismissPattern>>,
 }
 
 impl PealConfig {
@@ -188,6 +221,11 @@ impl PealConfig {
             .stet_start_extra_args
             .unwrap_or_default(),
         stet_run_extra_args: merged.stet_run_extra_args.unwrap_or_default(),
+        stet_disable_llm_triage: merged.stet_disable_llm_triage.unwrap_or(false),
+        stet_dismiss_patterns: validate_stet_dismiss_patterns(
+            merged.stet_dismiss_patterns.unwrap_or_default(),
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?,
     })
     }
 }
@@ -216,6 +254,8 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         stet_start_ref: fc.stet_start_ref,
         stet_start_extra_args: fc.stet_start_extra_args,
         stet_run_extra_args: fc.stet_run_extra_args,
+        stet_disable_llm_triage: fc.stet_disable_llm_triage,
+        stet_dismiss_patterns: fc.stet_dismiss_patterns,
     })
 }
 
@@ -251,15 +291,48 @@ fn load_env_layer(
         stet_run_extra_args: env_fn("STET_RUN_EXTRA_ARGS")
             .as_deref()
             .map(parse_extra_args_str),
+        stet_disable_llm_triage: parse_env_bool(env_fn, "STET_DISABLE_LLM_TRIAGE")?,
+        stet_dismiss_patterns: env_fn("STET_DISMISS_PATTERNS").as_deref().map(parse_dismiss_patterns),
     })
 }
 
-/// Parse a string of extra args: split on comma and/or whitespace, trim, drop empty.
 fn parse_extra_args_str(s: &str) -> Vec<String> {
     s.split(',')
         .flat_map(|part| part.split_whitespace().map(|t| t.to_owned()))
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Parse PEAL_STET_DISMISS_PATTERNS: comma-separated "pattern|reason" (e.g. "generated|out_of_scope,false positive|false_positive").
+/// Skips invalid reasons; returns empty vec if any entry fails to parse.
+fn parse_dismiss_patterns(s: &str) -> Vec<StetDismissPattern> {
+    s.split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let mut split = part.splitn(2, '|');
+            let pattern = split.next()?.trim().to_owned();
+            let reason = split.next()?.trim().to_owned();
+            if pattern.is_empty() || !StetDismissPattern::is_valid_reason(&reason) {
+                return None;
+            }
+            Some(StetDismissPattern { pattern, reason })
+        })
+        .collect()
+}
+
+/// Validate each pattern's reason; return error if any reason is not one of the four allowed.
+fn validate_stet_dismiss_patterns(
+    patterns: Vec<StetDismissPattern>,
+) -> Result<Vec<StetDismissPattern>, PealError> {
+    for p in &patterns {
+        if !StetDismissPattern::is_valid_reason(&p.reason) {
+            return Err(PealError::InvalidStetDismissReason {
+                value: p.reason.clone(),
+            });
+        }
+    }
+    Ok(patterns)
 }
 
 fn parse_env_u32(
@@ -336,6 +409,8 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
             .as_deref()
             .map(parse_extra_args_str),
         stet_run_extra_args: args.stet_run_args.as_deref().map(parse_extra_args_str),
+        stet_disable_llm_triage: args.stet_disable_llm_triage,
+        stet_dismiss_patterns: None,
     }
 }
 
@@ -381,6 +456,14 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .stet_run_extra_args
             .or(env.stet_run_extra_args)
             .or(file.stet_run_extra_args),
+        stet_disable_llm_triage: cli
+            .stet_disable_llm_triage
+            .or(env.stet_disable_llm_triage)
+            .or(file.stet_disable_llm_triage),
+        stet_dismiss_patterns: cli
+            .stet_dismiss_patterns
+            .or(env.stet_dismiss_patterns)
+            .or(file.stet_dismiss_patterns),
     }
 }
 
@@ -414,6 +497,7 @@ mod tests {
             stet_start_ref: None,
             stet_start_args: None,
             stet_run_args: None,
+            stet_disable_llm_triage: None,
         }
     }
 
@@ -529,6 +613,7 @@ model = "from-file"
             stet_start_ref: None,
             stet_start_args: None,
             stet_run_args: None,
+            stet_disable_llm_triage: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
 
@@ -596,6 +681,7 @@ agent_cmd = "from-file"
             stet_start_ref: None,
             stet_start_args: None,
             stet_run_args: None,
+            stet_disable_llm_triage: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
 
@@ -688,6 +774,7 @@ bogus_key = true
             stet_start_ref: None,
             stet_start_args: None,
             stet_run_args: None,
+            stet_disable_llm_triage: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
 
@@ -850,6 +937,7 @@ sandbox = "file-sandbox"
             stet_start_ref: None,
             stet_start_args: None,
             stet_run_args: None,
+            stet_disable_llm_triage: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
 
