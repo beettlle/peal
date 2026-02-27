@@ -1504,6 +1504,19 @@ mod tests {
             .arg("init")
             .output()
             .unwrap();
+        // Set identity so git commit works in CI (no global config).
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .unwrap();
         std::fs::write(repo.join("foo.txt"), "content").unwrap();
 
         let result = super::commit_after_phase2(repo, 1, Some("my suffix"));
@@ -1528,6 +1541,19 @@ mod tests {
             .arg("-C")
             .arg(repo)
             .arg("init")
+            .output()
+            .unwrap();
+        // Set identity so git commit works in CI (no global config).
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.name", "Test User"])
             .output()
             .unwrap();
         std::fs::write(repo.join("bar.txt"), "x").unwrap();
