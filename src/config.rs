@@ -265,10 +265,16 @@ impl PealConfig {
             phase_retry_count: merged
                 .phase_retry_count
                 .unwrap_or(DEFAULT_PHASE_RETRY_COUNT),
-            parallel: merged
-                .parallel
-                .or_else(|| merged.max_parallel.and_then(|n| if n > 0 { Some(true) } else { None }))
-                .unwrap_or(false),
+            parallel: {
+                if merged.max_parallel == Some(0) {
+                    false
+                } else {
+                    merged
+                        .parallel
+                        .or_else(|| merged.max_parallel.and_then(|n| if n > 0 { Some(true) } else { None }))
+                        .unwrap_or(false)
+                }
+            },
             max_parallel: merged.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL),
             continue_with_remaining_tasks: merged.continue_with_remaining_tasks.unwrap_or(false),
             log_level: merged.log_level,
