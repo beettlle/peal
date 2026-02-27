@@ -1019,7 +1019,14 @@ D
     #[test]
     fn parse_docs_improvement_plan() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let plan = parse_plan_file(&root.join("docs/improvement-plan.md")).unwrap();
+        let plan_path = root.join("docs/improvement-plan.md");
+        let plan = parse_plan_file(&plan_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to load {}: {} (run from repo root)",
+                plan_path.display(),
+                e
+            )
+        });
         assert_eq!(plan.tasks.len(), 22, "improvement-plan.md should have 22 tasks");
         assert_eq!(
             plan.tasks.iter().map(|t| t.index).collect::<Vec<_>>(),
