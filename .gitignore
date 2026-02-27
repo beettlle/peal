@@ -35,3 +35,4 @@ peal.local.toml
 /target
 # binary
 peal
+Cargo.lock
