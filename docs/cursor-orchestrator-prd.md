@@ -33,7 +33,7 @@ Build a **separate Rust application**. The three phases per task (create plan, e
 3. **Consume a single feature plan file:** The orchestrator reads one markdown file (path configurable or passed as argument) and iterates over discrete tasks in a canonical format (§5).
 4. **Resume after failure:** Persist state (plan path, repo path, completed task indices) so the run can resume from the next task after a crash or stop.
 5. **Single binary; no runtime dependency:** The orchestrator SHALL be distributable as one static (or mostly static) binary per platform. It SHALL NOT require Python or Node at runtime.
-6. **Use Cursor's Auto model by default:** The orchestrator SHALL omit `--model` (or use `--model auto` if the Cursor CLI documents it) so Cursor selects the model. An optional config override SHALL allow a specific model (e.g. `--model "gpt-5.2"`).
+6. **Use Cursor's Auto model by default:** When model is unset, the orchestrator SHALL omit `--model` so the Cursor CLI uses its default (Auto). An optional config override SHALL allow a specific model (e.g. `--model "gpt-5.2"`).
 7. **Security:** The orchestrator SHALL invoke the Cursor CLI **without** a shell (exec-style). Prompt construction SHALL be explicit and centralized to reduce prompt-injection and memory-safety risks (§11).
 
 ### Non-Goals for v1
@@ -88,20 +88,20 @@ Tasks MAY be marked as parallelizable so that the orchestrator runs them concurr
 The following sequence SHALL be implemented without reordering; ambiguity is resolved by this section.
 
 1. **Phase 1 — Create plan**
-   - Orchestrator invokes Cursor CLI once with: configurable `agent_cmd`, `--mode=plan` (or `--plan` per Cursor CLI docs), `-p "Create a plan for implementing this task: {task_content}"`. No `--model` (Auto). Working directory = target repo root.
+   - Orchestrator invokes Cursor CLI once with: configurable `agent_cmd`, `--plan` (per Cursor CLI docs), and the prompt as the **final positional argument** (see §8). No `--model` when using Auto. Working directory = target repo root.
    - Orchestrator SHALL capture stdout (and optionally stderr) as the **plan text**. If the Cursor CLI writes the plan to a file instead of stdout, the PRD defers to the actual CLI behavior: the orchestrator SHALL read the plan from the documented output (stdout or a documented file path).
    - Timeout: configurable; on timeout SHALL fail the task, persist state, exit non-zero. Non-zero exit from the CLI: SHALL be configurable (retry once vs. fail task); default SHALL be fail task and persist state.
 
 2. **Phase 2 — Execute plan**
-   - Orchestrator invokes Cursor CLI once: `{agent_cmd} -p "Execute the following plan. Do not re-plan; only implement and test.\n\n{plan_text}"`. Agent mode (default). No `--model` unless overridden. Working directory = target repo root. If the agent must run git/stet, sandbox SHALL be disabled via config (e.g. `--sandbox disabled`); see §8.
+   - Orchestrator invokes Cursor CLI once with the prompt (including plan text) as the **final positional argument** (see §8). Agent mode (default). No `--model` unless overridden. Working directory = target repo root. If the agent must run git/stet, sandbox SHALL be disabled via config (e.g. `--sandbox disabled`); see §8.
    - Orchestrator SHALL capture stdout/stderr for logging; there is no requirement to parse code from output (the agent edits files on disk).
    - Timeout and non-zero exit: same policy as phase 1 (configurable; default fail task, persist state).
 
 3. **Phase 3 — Stet and address (when stet is available)**
    - If stet is **not** found on the system (or not configured), the orchestrator SHALL skip phase 3 (3a–3c) and proceed to the next task. Stet is not a requirement.
    - **3a.** When stet is available: orchestrator runs the **stet command sequence** (§9) in the **target repository** (working directory = repo root). Orchestrator SHALL capture full stdout and stderr.
-   - **3b.** If there are findings (§9): orchestrator invokes Cursor CLI with `{agent_cmd} -p "Address the following stet review findings. Apply fixes and run tests.\n\n{stet_output}"`. Optional: `--output-format text` for parseable output. Working directory = repo root. Orchestrator SHALL capture stdout/stderr.
-   - **3c.** After the agent run, orchestrator MAY re-run the stet command sequence. If findings remain and round count &lt; N (configurable `max_address_rounds`), repeat 3b–3c; else proceed: SHALL either fail the task (configurable) or mark task as "has remaining findings" and continue to next task (configurable). Default SHALL be documented (e.g. warn and continue).
+   - **3b.** If there are findings (§9): orchestrator invokes Cursor CLI with the "address findings" prompt as the **final positional argument** (see §8). Optional: `--output-format text` for parseable output. Working directory = repo root. Orchestrator SHALL capture stdout/stderr.
+   - **3c.** After the agent run, orchestrator MAY re-run the stet command sequence. When findings remain after max address rounds, the orchestrator SHALL either **fail the task** (default) or **warn and continue** to the next task, as configured (e.g. `on_findings_remaining`). **Implementation default is fail**: strict-by-default so that runs do not silently continue with open findings unless the user configures warn-and-continue. The default value is documented in the configuration reference. See [configuration](configuration.md) for the default value and config key.
 
 ### Parallel blocks
 
@@ -163,7 +163,7 @@ User provides path to feature plan markdown and path to target repo (via config 
 
 ### Flow 2 — Resume
 
-After crash or stop, user runs orchestrator with "resume" (and same plan path / repo path). Orchestrator loads persisted state (§10), skips tasks whose index is in the completed list, continues from the next task. An entire parallel block is considered complete only when all its tasks are in `completed_task_indices`. If one or more tasks in a block are not completed, on resume the orchestrator SHALL run only the tasks in that block that are not in `completed_task_indices`, in parallel (phases 1 and 2 concurrently, then phase 3 sequentially); it SHALL NOT re-run tasks already in `completed_task_indices`.
+After a crash or stop, the user runs the same command again (same plan path and repo path); the orchestrator resumes automatically when it finds matching state. Orchestrator loads persisted state (§10), skips tasks whose index is in the completed list, continues from the next task. An entire parallel block is considered complete only when all its tasks are in `completed_task_indices`. If one or more tasks in a block are not completed, on resume the orchestrator SHALL run only the tasks in that block that are not in `completed_task_indices`, in parallel (phases 1 and 2 concurrently, then phase 3 sequentially); it SHALL NOT re-run tasks already in `completed_task_indices`.
 
 ### Flow 3 — Single task
 
@@ -173,11 +173,11 @@ User MAY request "run only task N" (e.g. for debugging). Orchestrator runs phase
 
 ## 8. Cursor CLI Contract
 
-- **Reference:** [Cursor CLI Overview](https://cursor.com/docs/cli/overview).
-- **Invocation:** Non-interactive only. The orchestrator SHALL use `-p "..."` for the prompt. No interactive approval; suitable for scripts/automation.
+- **Reference:** [Cursor CLI Overview](https://docs.cursor.com/context/cli-overview). Implementers SHALL verify exact flag names and prompt syntax from the current Cursor CLI documentation.
+- **Invocation:** Non-interactive only. The orchestrator passes the prompt as the **final positional argument** in the argv (unless the Cursor CLI docs specify `-p` / `--prompt`; then the implementation SHALL match the docs). No interactive approval; suitable for scripts/automation.
 - **Command:** Configurable binary name (e.g. `agent` or `cursor-agent`). Default SHALL be `agent` (per Cursor install docs). Resolved from PATH. The orchestrator SHALL invoke the binary **without** a shell (exec-style; see §11).
-- **Modes:** Phase 1: `--mode=plan` or `--plan` (per Cursor CLI docs). Phases 2 and 3: default mode (Agent). Implementers SHALL verify exact flag names from the current Cursor CLI documentation.
-- **Model:** Omit `--model` to use Auto. Optional config key (e.g. `model`) SHALL allow override (e.g. `"gpt-5.2"`).
+- **Modes:** Phase 1 (and plan normalization): `--plan` (or `--mode=plan` per Cursor CLI docs). Phases 2 and 3: default mode (Agent). Implementers SHALL verify exact flag names from the current Cursor CLI documentation.
+- **Model:** When model is **unset** in config, the orchestrator SHALL **omit** `--model` so the Cursor CLI uses its default (Auto). When model is set, the orchestrator SHALL pass `--model <value>`.
 - **Output:** For phases where the orchestrator must capture the reply (plan text in phase 1; optional address summary in phase 3), the orchestrator SHALL capture stdout and MAY capture stderr. Use of `--output-format text` (if supported) is RECOMMENDED for parseable output.
 - **Sandbox:** When the agent must run git or stet, sandbox SHALL be disabled. Configurable (e.g. `--sandbox disabled` or equivalent per Cursor CLI docs). Default for execute and address phases SHALL be documented (e.g. disabled when repo_path is set).
 - **Working directory:** All Cursor CLI invocations SHALL run with current working directory set to the **target repository root** so the agent sees the repo.
@@ -196,12 +196,9 @@ When stet is available, the orchestrator runs stet **in the target repository** 
 
 ### Exact command sequence
 
-- **"Run stet"** means: working directory = target repo root; then run the configured sequence. For v1 the minimal sequence SHALL be:
-  1. `stet start [ref]` — Start review from baseline. The ref (e.g. `HEAD~1` or a branch) SHALL be configurable; default MAY be current `HEAD` or user-configured.
-  2. `stet run` — Re-run incremental review and produce findings.
-- Alternatively, the orchestrator MAY support a single **wrapper command** (e.g. a script or `stet start && stet run`) if the user's workflow is one command; the config key (e.g. `stet_commands` or `stet_run_script`) SHALL be defined so that either a list of commands or one wrapper can be specified.
-- **After "address findings":** To re-check, the orchestrator runs `stet run` again (no new `stet start` unless the session was finished).
-- **Cleanup:** The orchestrator SHALL run `stet finish` at the end of the task (or run) to persist state and clean up the worktree.
+- **Built-in sequence (default):** When `stet_commands` is empty and stet is available, the orchestrator runs: (1) `stet start [ref]` — start review from baseline; (2) per task, `stet run` — incremental review and findings; (3) after all tasks, `stet finish` — persist state and clean up. Working directory = target repo root; ref (e.g. `HEAD~1`) is configurable.
+- **Custom sequence (`stet_commands`):** When `stet_commands` is non-empty, that list **replaces** the built-in sequence. **Session start** = run all commands in order once (CWD = repo root, timeout = e.g. `phase_timeout_sec`). **Per-task run** = run only the **last** command (expected to produce findings output); same command is re-run after each address round. **Cleanup** = not run by the orchestrator; the user adds `stet finish` (or equivalent) to `post_run_commands` if needed.
+- **After "address findings":** To re-check, the orchestrator runs `stet run` again (built-in) or the last custom command again (custom); no new session start.
 - **Optional Fixes:** If stet supports fix suggestions (e.g. via `stet fix` or `--suggest-fixes` in `stet start`), the orchestrator MAY include the suggested patch in the "address findings" prompt to the Cursor CLI.
 
 ### Capture and "findings present"
@@ -234,7 +231,7 @@ On startup with "resume," orchestrator SHALL load state, skip tasks whose index 
 
 ### Subprocess
 
-The orchestrator MUST use process execution **without** a shell. Arguments (prompt, flags) SHALL be passed as separate arguments (e.g. `Command::new(agent_cmd).arg("--mode=plan").arg("-p").arg(prompt).current_dir(repo_root)`). The orchestrator SHALL NOT build a single string and pass it to `sh -c`, `cmd /c`, or any shell.
+The orchestrator MUST use process execution **without** a shell. Arguments (prompt, flags) SHALL be passed as separate arguments (e.g. `Command::new(agent_cmd).arg("--plan").arg("--workspace").arg(repo_root).arg(prompt).current_dir(repo_root)`). The prompt is the final positional argument (see §8). The orchestrator SHALL NOT build a single string and pass it to `sh -c`, `cmd /c`, or any shell.
 
 ### Prompt construction
 

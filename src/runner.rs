@@ -3,7 +3,7 @@
 //! SP-1.6: run Phase 1 for every task in order, capture plan text, log results.
 //! SP-2.2: sequential runner — Phase 1 → Phase 2 per task, fail-fast.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,78 @@ fn run_stet_review_with_policy(
     }
 }
 
+/// Run the last command of stet_commands with on_stet_fail policy. Same semantics as run_stet_review_with_policy.
+fn run_custom_stet_run_with_policy(
+    last_command: &str,
+    repo_path: &Path,
+    timeout: Option<Duration>,
+    on_stet_fail: &str,
+    task_index: u32,
+    peal_state: &mut PealState,
+    state_dir: &Path,
+) -> Result<Option<stet::StetRunResult>, PealError> {
+    let first = stet::run_review_via_command(last_command, repo_path, timeout);
+    match first {
+        Ok(r) => return Ok(Some(r)),
+        Err(e) => {
+            if on_stet_fail == "retry_once" {
+                warn!(task_index, err = %e, "custom stet run failed, retrying once");
+                match stet::run_review_via_command(last_command, repo_path, timeout) {
+                    Ok(r) => return Ok(Some(r)),
+                    Err(e2) => {
+                        error!(task_index, err = %e2, "custom stet run failed");
+                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                            error!(err = %save_err, "failed to save state after stet failure");
+                        }
+                        return Err(e2);
+                    }
+                }
+            }
+            if on_stet_fail == "skip" {
+                warn!(task_index, err = %e, "stet phase skipped");
+                return Ok(None);
+            }
+            error!(task_index, err = %e, "custom stet run failed");
+            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                error!(err = %save_err, "failed to save state after stet failure");
+            }
+            return Err(e);
+        }
+    }
+}
+
+/// When config.validate_plan_text is true, checks plan text length (and optionally
+/// expected tokens). Returns Ok(()) if disabled or valid, Err(PealError::Phase1PlanTextInvalid)
+/// if invalid.
+pub(crate) fn validate_plan_text(
+    config: &PealConfig,
+    task_index: u32,
+    plan_text: &str,
+) -> Result<(), PealError> {
+    if !config.validate_plan_text {
+        return Ok(());
+    }
+    if plan_text.is_empty() {
+        return Err(PealError::Phase1PlanTextInvalid {
+            task_index,
+            detail: "plan text is empty".into(),
+        });
+    }
+    if let Some(min) = config.min_plan_text_len {
+        if plan_text.len() < min {
+            return Err(PealError::Phase1PlanTextInvalid {
+                task_index,
+                detail: format!(
+                    "plan text length {} below minimum {}",
+                    plan_text.len(),
+                    min
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The result of running Phase 1 for a single task.
 #[derive(Debug, Clone)]
 pub struct TaskPhase1Result {
@@ -72,6 +144,14 @@ pub struct TaskResult {
     pub plan_text: String,
     pub phase2_stdout: String,
     pub phase3_outcome: Option<stet::AddressLoopOutcome>,
+}
+
+/// Outcome of a full scheduled run: task results and indices of tasks that failed
+/// when `continue_with_remaining_tasks` is true.
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub results: Vec<TaskResult>,
+    pub failed_task_indices: Vec<u32>,
 }
 
 /// Run Phase 1 (plan creation) for every task in order.
@@ -137,6 +217,33 @@ pub fn run_phase1_all(
             "phase 1 complete"
         );
 
+        let mut output = output;
+        if let Err(e) = validate_plan_text(config, task.index, &output.stdout) {
+            warn!(
+                task_index = task.index,
+                position,
+                task_count,
+                err = %e,
+                "plan text validation failed, retrying phase 1 once"
+            );
+            let second = phase::run_phase1(agent_path, config, task.index, &task.content)
+                .map_err(|e| {
+                    error!(
+                        task_index = task.index,
+                        position,
+                        task_count,
+                        err = %e,
+                        "phase 1 retry failed"
+                    );
+                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                        error!(err = %save_err, "failed to save state after phase 1 failure");
+                    }
+                    e
+                })?;
+            output = second;
+            validate_plan_text(config, task.index, &output.stdout)?;
+        }
+
         peal_state.mark_task_completed(task.index);
         state::save_state(peal_state, state_dir)?;
 
@@ -163,7 +270,7 @@ fn run_single_task(
     task: &crate::plan::Task,
     peal_state: &mut PealState,
     state_dir: &Path,
-    stet_path: Option<&Path>,
+    phase3_mode: Option<&stet::StetPhase3Mode>,
     task_count: usize,
     position: usize,
 ) -> Result<TaskResult, PealError> {
@@ -175,7 +282,7 @@ fn run_single_task(
 
     let p1_start = Instant::now();
 
-    let p1_output: PhaseOutput =
+    let mut p1_output: PhaseOutput =
         phase::run_phase1(agent_path, config, task.index, &task.content).map_err(|e| {
             error!(
                 task_index = task.index,
@@ -200,6 +307,44 @@ fn run_single_task(
         plan_text_len = p1_output.stdout.len(),
         "phase 1 complete"
     );
+
+    if let Err(e) = validate_plan_text(config, task.index, &p1_output.stdout) {
+        warn!(
+            task_index = task.index,
+            position,
+            task_count,
+            err = %e,
+            "plan text validation failed, retrying phase 1 once"
+        );
+        p1_output = phase::run_phase1(agent_path, config, task.index, &task.content).map_err(
+            |e| {
+                error!(
+                    task_index = task.index,
+                    position,
+                    task_count,
+                    err = %e,
+                    "phase 1 retry failed"
+                );
+                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                    error!(err = %save_err, "failed to save state after phase 1 failure");
+                }
+                e
+            },
+        )?;
+        validate_plan_text(config, task.index, &p1_output.stdout).map_err(|e| {
+            error!(
+                task_index = task.index,
+                position,
+                task_count,
+                err = %e,
+                "plan text still invalid after retry"
+            );
+            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                error!(err = %save_err, "failed to save state after plan text validation failure");
+            }
+            e
+        })?;
+    }
 
     // -- Phase 2 --
     info!(
@@ -236,94 +381,205 @@ fn run_single_task(
     );
 
     // -- Phase 3 (stet review + address) --
-    let phase3_outcome = if let Some(sp) = stet_path {
-        let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+    let phase3_outcome = match phase3_mode {
+        None => None,
+        Some(mode) => match mode {
+            stet::StetPhase3Mode::BuiltIn(stet_path) => {
+            let sp = stet_path.as_path();
+            let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
 
-        info!(
-            task_index = task.index,
-            position, task_count,
-            "phase 3: running stet review"
-        );
+            info!(
+                task_index = task.index,
+                position, task_count,
+                "phase 3: running stet review"
+            );
 
-        let stet_result = run_stet_review_with_policy(
-            sp,
-            &config.repo_path,
-            &config.stet_run_extra_args,
-            timeout,
-            config.on_stet_fail.as_str(),
-            task.index,
-            peal_state,
-            state_dir,
-        )?;
+            let stet_result = run_stet_review_with_policy(
+                sp,
+                &config.repo_path,
+                &config.stet_run_extra_args,
+                timeout,
+                config.on_stet_fail.as_str(),
+                task.index,
+                peal_state,
+                state_dir,
+            )?;
 
-        let stet_result = match stet_result {
-            Some(r) => r,
-            None => {
-                // skip: stet run failed, phase 3 skipped for this task
-                info!(task_index = task.index, "phase 3 skipped (stet run failed)");
-                peal_state.mark_task_completed(task.index);
-                state::save_state(peal_state, state_dir)?;
+            let stet_result = match stet_result {
+                Some(r) => r,
+                None => {
+                    // skip: stet run failed, phase 3 skipped for this task
+                    info!(task_index = task.index, "phase 3 skipped (stet run failed)");
+                    peal_state.mark_task_completed(task.index);
+                    state::save_state(peal_state, state_dir)?;
+                    return Ok(TaskResult {
+                        task_index: task.index,
+                        plan_text: p1_output.stdout,
+                        phase2_stdout: p2_output.stdout,
+                        phase3_outcome: None,
+                    });
+                }
+            };
+
+            if stet_result.has_findings {
+                info!(task_index = task.index, "phase 3: findings detected, starting address loop");
+
+                let outcome = match stet::address_loop(agent_path, sp, config, task.index, &stet_result) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        if config.on_stet_fail == "retry_once" {
+                            warn!(task_index = task.index, err = %e, "address loop failed, retrying once");
+                            match stet::address_loop(agent_path, sp, config, task.index, &stet_result) {
+                                Ok(o) => o,
+                                Err(e2) => {
+                                    error!(task_index = task.index, err = %e2, "address loop failed after retry");
+                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                        error!(err = %save_err, "failed to save state after address failure");
+                                    }
+                                    return Err(e2);
+                                }
+                            }
+                        } else if config.on_stet_fail == "skip" {
+                            warn!(task_index = task.index, err = %e, "stet phase skipped");
+                            stet::AddressLoopOutcome {
+                                rounds_used: 0,
+                                findings_resolved: false,
+                                last_stet_result: stet_result.clone(),
+                            }
+                        } else {
+                            error!(task_index = task.index, err = %e, "address loop failed");
+                            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                error!(err = %save_err, "failed to save state after address failure");
+                            }
+                            return Err(e);
+                        }
+                    }
+                };
+
+                info!(
+                    task_index = task.index,
+                    rounds = outcome.rounds_used,
+                    resolved = outcome.findings_resolved,
+                    "phase 3 complete"
+                );
+                Some(outcome)
+            } else {
+                info!(task_index = task.index, "phase 3: no findings, skipping address loop");
+                Some(stet::AddressLoopOutcome {
+                    rounds_used: 0,
+                    findings_resolved: true,
+                    last_stet_result: stet_result,
+                })
+            }
+        }
+        stet::StetPhase3Mode::CustomCommands(commands) => {
+            let Some(last_cmd) = commands.last() else {
                 return Ok(TaskResult {
                     task_index: task.index,
                     plan_text: p1_output.stdout,
                     phase2_stdout: p2_output.stdout,
                     phase3_outcome: None,
                 });
-            }
-        };
-
-        if stet_result.has_findings {
-            info!(task_index = task.index, "phase 3: findings detected, starting address loop");
-
-            let outcome = match stet::address_loop(agent_path, sp, config, task.index, &stet_result) {
-                Ok(o) => o,
-                Err(e) => {
-                    if config.on_stet_fail == "retry_once" {
-                        warn!(task_index = task.index, err = %e, "address loop failed, retrying once");
-                        match stet::address_loop(agent_path, sp, config, task.index, &stet_result) {
-                            Ok(o) => o,
-                            Err(e2) => {
-                                error!(task_index = task.index, err = %e2, "address loop failed after retry");
-                                if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                                    error!(err = %save_err, "failed to save state after address failure");
-                                }
-                                return Err(e2);
-                            }
-                        }
-                    } else if config.on_stet_fail == "skip" {
-                        warn!(task_index = task.index, err = %e, "stet phase skipped");
-                        stet::AddressLoopOutcome {
-                            rounds_used: 0,
-                            findings_resolved: false,
-                            last_stet_result: stet_result.clone(),
-                        }
-                    } else {
-                        error!(task_index = task.index, err = %e, "address loop failed");
-                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                            error!(err = %save_err, "failed to save state after address failure");
-                        }
-                        return Err(e);
-                    }
-                }
             };
+            let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
 
             info!(
                 task_index = task.index,
-                rounds = outcome.rounds_used,
-                resolved = outcome.findings_resolved,
-                "phase 3 complete"
+                position, task_count,
+                "phase 3: running custom stet command"
             );
-            Some(outcome)
-        } else {
-            info!(task_index = task.index, "phase 3: no findings, skipping address loop");
-            Some(stet::AddressLoopOutcome {
-                rounds_used: 0,
-                findings_resolved: true,
-                last_stet_result: stet_result,
-            })
+
+            let stet_result = run_custom_stet_run_with_policy(
+                last_cmd,
+                &config.repo_path,
+                timeout,
+                config.on_stet_fail.as_str(),
+                task.index,
+                peal_state,
+                state_dir,
+            )?;
+
+            let stet_result = match stet_result {
+                Some(r) => r,
+                None => {
+                    info!(task_index = task.index, "phase 3 skipped (custom stet run failed)");
+                    peal_state.mark_task_completed(task.index);
+                    state::save_state(peal_state, state_dir)?;
+                    return Ok(TaskResult {
+                        task_index: task.index,
+                        plan_text: p1_output.stdout,
+                        phase2_stdout: p2_output.stdout,
+                        phase3_outcome: None,
+                    });
+                }
+            };
+
+            if stet_result.has_findings {
+                info!(task_index = task.index, "phase 3: findings detected, starting address loop (custom)");
+
+                let last_cmd = last_cmd.clone();
+                let repo_path = config.repo_path.clone();
+                let outcome = match stet::address_loop_custom(
+                    agent_path,
+                    config,
+                    task.index,
+                    &stet_result,
+                    || stet::run_review_via_command(&last_cmd, &repo_path, timeout),
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        if config.on_stet_fail == "retry_once" {
+                            warn!(task_index = task.index, err = %e, "address loop (custom) failed, retrying once");
+                            match stet::address_loop_custom(
+                                agent_path,
+                                config,
+                                task.index,
+                                &stet_result,
+                                || stet::run_review_via_command(&last_cmd, &repo_path, timeout),
+                            ) {
+                                Ok(o) => o,
+                                Err(e2) => {
+                                    error!(task_index = task.index, err = %e2, "address loop (custom) failed after retry");
+                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                        error!(err = %save_err, "failed to save state after address failure");
+                                    }
+                                    return Err(e2);
+                                }
+                            }
+                        } else if config.on_stet_fail == "skip" {
+                            warn!(task_index = task.index, err = %e, "stet phase skipped");
+                            stet::AddressLoopOutcome {
+                                rounds_used: 0,
+                                findings_resolved: false,
+                                last_stet_result: stet_result.clone(),
+                            }
+                        } else {
+                            error!(task_index = task.index, err = %e, "address loop (custom) failed");
+                            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                error!(err = %save_err, "failed to save state after address failure");
+                            }
+                            return Err(e);
+                        }
+                    }
+                };
+
+                info!(
+                    task_index = task.index,
+                    rounds = outcome.rounds_used,
+                    resolved = outcome.findings_resolved,
+                    "phase 3 complete (custom)"
+                );
+                Some(outcome)
+            } else {
+                info!(task_index = task.index, "phase 3: no findings, skipping address loop");
+                Some(stet::AddressLoopOutcome {
+                    rounds_used: 0,
+                    findings_resolved: true,
+                    last_stet_result: stet_result,
+                })
+            }
         }
-    } else {
-        None
+        }
     };
 
     peal_state.mark_task_completed(task.index);
@@ -352,7 +608,7 @@ fn run_phases_1_2(
     );
 
     let p1_start = Instant::now();
-    let p1_output =
+    let mut p1_output =
         phase::run_phase1(agent_path, config, task.index, &task.content).map_err(|e| {
             error!(
                 task_index = task.index,
@@ -369,6 +625,24 @@ fn run_phases_1_2(
         plan_text_len = p1_output.stdout.len(),
         "phase 1 complete"
     );
+
+    if let Err(e) = validate_plan_text(config, task.index, &p1_output.stdout) {
+        warn!(
+            task_index = task.index,
+            position, task_count, err = %e,
+            "plan text validation failed, retrying phase 1 once"
+        );
+        p1_output = phase::run_phase1(agent_path, config, task.index, &task.content).map_err(
+            |e| {
+                error!(
+                    task_index = task.index,
+                    position, task_count, err = %e, "phase 1 retry failed"
+                );
+                e
+            },
+        )?;
+        validate_plan_text(config, task.index, &p1_output.stdout)?;
+    }
 
     info!(
         task_index = task.index,
@@ -455,6 +729,47 @@ fn run_parallel_block(
     (successes, failures)
 }
 
+/// If consecutive_failures >= cap, saves state (best-effort) and returns ConsecutiveTaskFailuresCapReached.
+/// Otherwise returns Ok(()).
+fn check_consecutive_cap(
+    consecutive_failures: u32,
+    cap: u32,
+    peal_state: &mut PealState,
+    state_dir: &Path,
+) -> Result<(), PealError> {
+    if consecutive_failures >= cap {
+        let _ = state::save_state(peal_state, state_dir);
+        return Err(PealError::ConsecutiveTaskFailuresCapReached {
+            count: consecutive_failures,
+            cap,
+        });
+    }
+    Ok(())
+}
+
+/// Apply outcomes of a parallel block in segment (indices) order: success resets consecutive_failures,
+/// failure increments and optionally returns ConsecutiveTaskFailuresCapReached.
+fn apply_parallel_block_outcomes(
+    indices: &[u32],
+    block_failed: &std::collections::HashSet<u32>,
+    consecutive_failures: &mut u32,
+    cap: Option<u32>,
+    peal_state: &mut PealState,
+    state_dir: &Path,
+) -> Result<(), PealError> {
+    for &idx in indices {
+        if block_failed.contains(&idx) {
+            *consecutive_failures += 1;
+            if let Some(cap_val) = cap {
+                check_consecutive_cap(*consecutive_failures, cap_val, peal_state, state_dir)?;
+            }
+        } else {
+            *consecutive_failures = 0;
+        }
+    }
+    Ok(())
+}
+
 /// Segment-aware execution scheduler (SP-5.1).
 ///
 /// Execution order is derived solely from `plan.execution_schedule()` (i.e. `plan.segments`):
@@ -473,10 +788,10 @@ pub fn run_scheduled(
     plan: &ParsedPlan,
     peal_state: &mut PealState,
     state_dir: &Path,
-    stet_path: Option<&Path>,
-) -> Result<Vec<TaskResult>, PealError> {
+    phase3_mode: Option<stet::StetPhase3Mode>,
+) -> Result<RunOutcome, PealError> {
     let task_count = plan.tasks.len();
-    let phase3_available = stet_path.is_some();
+    let phase3_available = phase3_mode.is_some();
     let schedule = plan.execution_schedule();
     info!(
         task_count,
@@ -486,7 +801,10 @@ pub fn run_scheduled(
     );
 
     let mut results: Vec<TaskResult> = Vec::with_capacity(task_count);
+    let mut failed_task_indices: Vec<u32> = Vec::new();
     let mut position: usize = 0;
+    let mut consecutive_failures: u32 = 0;
+    let cap = config.max_consecutive_task_failures;
 
     for segment in schedule {
         match segment {
@@ -510,10 +828,30 @@ pub fn run_scheduled(
                 })?;
 
                 let result = run_single_task(
-                    agent_path, config, task, peal_state, state_dir, stet_path,
+                    agent_path, config, task, peal_state, state_dir, phase3_mode.as_ref(),
                     task_count, position,
-                )?;
-                results.push(result);
+                );
+                match result {
+                    Ok(r) => {
+                        consecutive_failures = 0;
+                        results.push(r);
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        if let Some(cap_val) = cap {
+                            check_consecutive_cap(
+                                consecutive_failures,
+                                cap_val,
+                                peal_state,
+                                state_dir,
+                            )?;
+                        }
+                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                            error!(err = %save_err, "failed to save state after task failure");
+                        }
+                        return Err(e);
+                    }
+                }
             }
 
             crate::plan::Segment::Parallel(indices) => {
@@ -565,6 +903,7 @@ pub fn run_scheduled(
 
                     let mut phase3_count = 0usize;
                     let mut phase3_continued_after_failure = false;
+                    let mut block_p3_failures: Vec<u32> = Vec::new();
                     for idx in indices {
                         let Some((plan_text, phase2_stdout)) = successes_by_index.remove(&idx) else {
                             continue;
@@ -574,86 +913,181 @@ pub fn run_scheduled(
 
                         let phase3_result: Result<Option<stet::AddressLoopOutcome>, PealError> =
                             (|| {
-                                if let Some(sp) = stet_path {
-                                    let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
-
-                                    info!(
-                                        task_index = idx,
-                                        position, task_count,
-                                        "phase 3: running stet review"
-                                    );
-
-                                    let stet_result = run_stet_review_with_policy(
-                                        sp,
-                                        &config.repo_path,
-                                        &config.stet_run_extra_args,
-                                        timeout,
-                                        config.on_stet_fail.as_str(),
-                                        *idx,
-                                        peal_state,
-                                        state_dir,
-                                    )?;
-
-                                    let stet_result = match stet_result {
-                                        Some(r) => r,
-                                        None => {
-                                            info!(task_index = idx, "phase 3 skipped (stet run failed)");
-                                            return Ok(None);
-                                        }
-                                    };
-
-                                    if stet_result.has_findings {
-                                        info!(task_index = idx, "phase 3: findings detected, starting address loop");
-
-                                        let outcome = match stet::address_loop(agent_path, sp, config, *idx, &stet_result) {
-                                            Ok(o) => o,
-                                            Err(e) => {
-                                                if config.on_stet_fail == "retry_once" {
-                                                    warn!(task_index = idx, err = %e, "address loop failed, retrying once");
-                                                    match stet::address_loop(agent_path, sp, config, *idx, &stet_result) {
-                                                        Ok(o) => o,
-                                                        Err(e2) => {
-                                                            error!(task_index = idx, err = %e2, "address loop failed after retry");
-                                                            if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                                                                error!(err = %save_err, "failed to save state after address failure");
-                                                            }
-                                                            return Err(e2);
-                                                        }
-                                                    }
-                                                } else if config.on_stet_fail == "skip" {
-                                                    warn!(task_index = idx, err = %e, "stet phase skipped");
-                                                    stet::AddressLoopOutcome {
-                                                        rounds_used: 0,
-                                                        findings_resolved: false,
-                                                        last_stet_result: stet_result.clone(),
-                                                    }
-                                                } else {
-                                                    error!(task_index = idx, err = %e, "address loop failed");
-                                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
-                                                        error!(err = %save_err, "failed to save state after address failure");
-                                                    }
-                                                    return Err(e);
-                                                }
-                                            }
-                                        };
+                                match phase3_mode.as_ref() {
+                                    None => return Ok(None),
+                                    Some(stet::StetPhase3Mode::BuiltIn(stet_path)) => {
+                                        let sp = stet_path.as_path();
+                                        let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
 
                                         info!(
                                             task_index = idx,
-                                            rounds = outcome.rounds_used,
-                                            resolved = outcome.findings_resolved,
-                                            "phase 3 complete"
+                                            position, task_count,
+                                            "phase 3: running stet review"
                                         );
-                                        Ok(Some(outcome))
-                                    } else {
+
+                                        let stet_result = run_stet_review_with_policy(
+                                            sp,
+                                            &config.repo_path,
+                                            &config.stet_run_extra_args,
+                                            timeout,
+                                            config.on_stet_fail.as_str(),
+                                            *idx,
+                                            peal_state,
+                                            state_dir,
+                                        )?;
+
+                                        let stet_result = match stet_result {
+                                            Some(r) => r,
+                                            None => {
+                                                info!(task_index = idx, "phase 3 skipped (stet run failed)");
+                                                return Ok(None);
+                                            }
+                                        };
+
+                                        if stet_result.has_findings {
+                                            info!(task_index = idx, "phase 3: findings detected, starting address loop");
+
+                                            let outcome = match stet::address_loop(agent_path, sp, config, *idx, &stet_result) {
+                                                Ok(o) => o,
+                                                Err(e) => {
+                                                    if config.on_stet_fail == "retry_once" {
+                                                        warn!(task_index = idx, err = %e, "address loop failed, retrying once");
+                                                        match stet::address_loop(agent_path, sp, config, *idx, &stet_result) {
+                                                            Ok(o) => o,
+                                                            Err(e2) => {
+                                                                error!(task_index = idx, err = %e2, "address loop failed after retry");
+                                                                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                                    error!(err = %save_err, "failed to save state after address failure");
+                                                                }
+                                                                return Err(e2);
+                                                            }
+                                                        }
+                                                    } else if config.on_stet_fail == "skip" {
+                                                        warn!(task_index = idx, err = %e, "stet phase skipped");
+                                                        stet::AddressLoopOutcome {
+                                                            rounds_used: 0,
+                                                            findings_resolved: false,
+                                                            last_stet_result: stet_result.clone(),
+                                                        }
+                                                    } else {
+                                                        error!(task_index = idx, err = %e, "address loop failed");
+                                                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                            error!(err = %save_err, "failed to save state after address failure");
+                                                        }
+                                                        return Err(e);
+                                                    }
+                                                }
+                                            };
+
+                                            info!(
+                                                task_index = idx,
+                                                rounds = outcome.rounds_used,
+                                                resolved = outcome.findings_resolved,
+                                                "phase 3 complete"
+                                            );
+                                            return Ok(Some(outcome));
+                                        }
                                         info!(task_index = idx, "phase 3: no findings, skipping address loop");
-                                        Ok(Some(stet::AddressLoopOutcome {
+                                        return Ok(Some(stet::AddressLoopOutcome {
                                             rounds_used: 0,
                                             findings_resolved: true,
                                             last_stet_result: stet_result,
-                                        }))
+                                        }));
                                     }
-                                } else {
-                                    Ok(None)
+                                    Some(stet::StetPhase3Mode::CustomCommands(commands)) => {
+                                        let Some(last_cmd) = commands.last() else {
+                                            return Ok(None);
+                                        };
+                                        let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+
+                                        info!(
+                                            task_index = idx,
+                                            position, task_count,
+                                            "phase 3: running custom stet command"
+                                        );
+
+                                        let stet_result = run_custom_stet_run_with_policy(
+                                            last_cmd,
+                                            &config.repo_path,
+                                            timeout,
+                                            config.on_stet_fail.as_str(),
+                                            *idx,
+                                            peal_state,
+                                            state_dir,
+                                        )?;
+
+                                        let stet_result = match stet_result {
+                                            Some(r) => r,
+                                            None => {
+                                                info!(task_index = idx, "phase 3 skipped (custom stet run failed)");
+                                                return Ok(None);
+                                            }
+                                        };
+
+                                        if stet_result.has_findings {
+                                            info!(task_index = idx, "phase 3: findings detected, starting address loop (custom)");
+
+                                            let last_cmd = last_cmd.clone();
+                                            let repo_path = config.repo_path.clone();
+                                            let outcome = match stet::address_loop_custom(
+                                                agent_path,
+                                                config,
+                                                *idx,
+                                                &stet_result,
+                                                || stet::run_review_via_command(&last_cmd, &repo_path, timeout),
+                                            ) {
+                                                Ok(o) => o,
+                                                Err(e) => {
+                                                    if config.on_stet_fail == "retry_once" {
+                                                        warn!(task_index = idx, err = %e, "address loop (custom) failed, retrying once");
+                                                        match stet::address_loop_custom(
+                                                            agent_path,
+                                                            config,
+                                                            *idx,
+                                                            &stet_result,
+                                                            || stet::run_review_via_command(&last_cmd, &repo_path, timeout),
+                                                        ) {
+                                                            Ok(o) => o,
+                                                            Err(e2) => {
+                                                                error!(task_index = idx, err = %e2, "address loop (custom) failed after retry");
+                                                                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                                    error!(err = %save_err, "failed to save state after address failure");
+                                                                }
+                                                                return Err(e2);
+                                                            }
+                                                        }
+                                                    } else if config.on_stet_fail == "skip" {
+                                                        warn!(task_index = idx, err = %e, "stet phase skipped");
+                                                        stet::AddressLoopOutcome {
+                                                            rounds_used: 0,
+                                                            findings_resolved: false,
+                                                            last_stet_result: stet_result.clone(),
+                                                        }
+                                                    } else {
+                                                        error!(task_index = idx, err = %e, "address loop (custom) failed");
+                                                        if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                                            error!(err = %save_err, "failed to save state after address failure");
+                                                        }
+                                                        return Err(e);
+                                                    }
+                                                }
+                                            };
+
+                                            info!(
+                                                task_index = idx,
+                                                rounds = outcome.rounds_used,
+                                                resolved = outcome.findings_resolved,
+                                                "phase 3 complete (custom)"
+                                            );
+                                            return Ok(Some(outcome));
+                                        }
+                                        info!(task_index = idx, "phase 3: no findings, skipping address loop");
+                                        return Ok(Some(stet::AddressLoopOutcome {
+                                            rounds_used: 0,
+                                            findings_resolved: true,
+                                            last_stet_result: stet_result,
+                                        }));
+                                    }
                                 }
                             })();
 
@@ -673,6 +1107,8 @@ pub fn run_scheduled(
                                         err = %e,
                                         "phase 3 failed in parallel block; continuing with remaining segments"
                                     );
+                                    failed_task_indices.push(*idx);
+                                    block_p3_failures.push(*idx);
                                     if let Err(save_err) = state::save_state(peal_state, state_dir) {
                                         error!(err = %save_err, "failed to save state after phase 3 failure");
                                     }
@@ -680,11 +1116,40 @@ pub fn run_scheduled(
                                     phase3_continued_after_failure = true;
                                     break;
                                 } else {
+                                    let mut block_failed: HashSet<u32> =
+                                        failures.iter().map(|(i, _)| *i).collect();
+                                    block_failed.insert(*idx);
+                                    apply_parallel_block_outcomes(
+                                        indices,
+                                        &block_failed,
+                                        &mut consecutive_failures,
+                                        cap,
+                                        peal_state,
+                                        state_dir,
+                                    )?;
+                                    if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                        error!(err = %save_err, "failed to save state after phase 3 failure");
+                                    }
                                     return Err(e);
                                 }
                             }
                         }
                     }
+
+                    // Apply outcomes in segment order for consecutive-failure cap.
+                    let block_failed: HashSet<u32> = failures
+                        .iter()
+                        .map(|(i, _)| *i)
+                        .chain(block_p3_failures.iter().copied())
+                        .collect();
+                    apply_parallel_block_outcomes(
+                        indices,
+                        &block_failed,
+                        &mut consecutive_failures,
+                        cap,
+                        peal_state,
+                        state_dir,
+                    )?;
 
                     let completed_in_block = indices.len() - pending.len();
                     if !phase3_continued_after_failure {
@@ -698,6 +1163,9 @@ pub fn run_scheduled(
                                 err = %err,
                                 "task failed in parallel block (P1/P2)"
                             );
+                            if config.continue_with_remaining_tasks {
+                                failed_task_indices.push(*fail_idx);
+                            }
                         }
                         if !config.continue_with_remaining_tasks {
                             if let Some((_idx, err)) = failures.into_iter().next() {
@@ -725,10 +1193,30 @@ pub fn run_scheduled(
                         })?;
 
                         let result = run_single_task(
-                            agent_path, config, task, peal_state, state_dir, stet_path,
+                            agent_path, config, task, peal_state, state_dir, phase3_mode.as_ref(),
                             task_count, position,
-                        )?;
-                        results.push(result);
+                        );
+                        match result {
+                            Ok(r) => {
+                                consecutive_failures = 0;
+                                results.push(r);
+                            }
+                            Err(e) => {
+                                consecutive_failures += 1;
+                                if let Some(cap_val) = cap {
+                                    check_consecutive_cap(
+                                        consecutive_failures,
+                                        cap_val,
+                                        peal_state,
+                                        state_dir,
+                                    )?;
+                                }
+                                if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                                    error!(err = %save_err, "failed to save state after task failure");
+                                }
+                                return Err(e);
+                            }
+                        }
                     }
 
                     let completed_in_block = indices.len() - pending.len();
@@ -743,7 +1231,10 @@ pub fn run_scheduled(
         task_count, "all tasks complete"
     );
 
-    Ok(results)
+    Ok(RunOutcome {
+        results,
+        failed_task_indices,
+    })
 }
 
 /// Run the full pipeline for every task. Delegates to `run_scheduled`.
@@ -755,9 +1246,9 @@ pub fn run_all(
     plan: &ParsedPlan,
     peal_state: &mut PealState,
     state_dir: &Path,
-    stet_path: Option<&Path>,
-) -> Result<Vec<TaskResult>, PealError> {
-    run_scheduled(agent_path, config, plan, peal_state, state_dir, stet_path)
+    phase3_mode: Option<stet::StetPhase3Mode>,
+) -> Result<RunOutcome, PealError> {
+    run_scheduled(agent_path, config, plan, peal_state, state_dir, phase3_mode)
 }
 
 #[cfg(test)]
@@ -780,6 +1271,7 @@ mod tests {
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -797,6 +1289,10 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         }
     }
 
@@ -811,6 +1307,74 @@ mod tests {
 
     fn resolve_echo() -> PathBuf {
         crate::cursor::resolve_agent_cmd("echo").expect("echo must exist")
+    }
+
+    // -- validate_plan_text helper tests --
+
+    #[test]
+    fn validate_plan_text_disabled_always_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        assert!(validate_plan_text(&config, 1, "").is_ok());
+        assert!(validate_plan_text(&config, 1, "x").is_ok());
+        assert!(validate_plan_text(&config, 1, "short").is_ok());
+    }
+
+    #[test]
+    fn validate_plan_text_enabled_empty_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.validate_plan_text = true;
+        config.min_plan_text_len = None;
+
+        let err = validate_plan_text(&config, 1, "").unwrap_err();
+        match &err {
+            PealError::Phase1PlanTextInvalid { task_index, detail } => {
+                assert_eq!(*task_index, 1);
+                assert!(detail.contains("empty"));
+            }
+            other => panic!("expected Phase1PlanTextInvalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_plan_text_enabled_below_min_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.validate_plan_text = true;
+        config.min_plan_text_len = Some(100);
+
+        let err = validate_plan_text(&config, 2, "x".repeat(50)).unwrap_err();
+        match &err {
+            PealError::Phase1PlanTextInvalid { task_index, detail } => {
+                assert_eq!(*task_index, 2);
+                assert!(detail.contains("50"));
+                assert!(detail.contains("100"));
+            }
+            other => panic!("expected Phase1PlanTextInvalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_plan_text_enabled_non_empty_ok_when_no_min() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.validate_plan_text = true;
+        config.min_plan_text_len = None;
+
+        assert!(validate_plan_text(&config, 1, "x").is_ok());
+        assert!(validate_plan_text(&config, 1, "any non-empty").is_ok());
+    }
+
+    #[test]
+    fn validate_plan_text_enabled_meets_min_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.validate_plan_text = true;
+        config.min_plan_text_len = Some(5);
+
+        assert!(validate_plan_text(&config, 1, "hello").is_ok());
+        assert!(validate_plan_text(&config, 1, "hello world").is_ok());
     }
 
     #[test]
@@ -885,6 +1449,7 @@ mod tests {
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -902,6 +1467,10 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -948,6 +1517,47 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_index, 42);
         assert!(results[0].plan_text.contains("The only task."));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn phase1_plan_text_validation_fails_after_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".peal");
+        let mut state = fresh_state();
+
+        let short_agent = dir.path().join("short_agent");
+        std::fs::write(&short_agent, "#!/bin/sh\necho x\n").unwrap();
+        std::fs::set_permissions(&short_agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = test_config(dir.path());
+        config.agent_cmd = short_agent.as_os_str().to_str().unwrap().to_owned();
+        config.validate_plan_text = true;
+        config.min_plan_text_len = Some(1000);
+
+        let plan = make_plan(vec![Task {
+            index: 1,
+            content: "Task.".to_owned(),
+            parallel: false,
+        }]);
+
+        let err = run_phase1_all(
+            &short_agent,
+            &config,
+            &plan,
+            &mut state,
+            &state_dir,
+            None,
+        )
+        .unwrap_err();
+
+        match &err {
+            PealError::Phase1PlanTextInvalid { task_index, detail } => {
+                assert_eq!(*task_index, 1);
+                assert!(detail.contains("below minimum") || detail.contains("empty"));
+            }
+            other => panic!("expected Phase1PlanTextInvalid, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1005,7 +1615,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].task_index, 1);
@@ -1039,7 +1649,7 @@ mod tests {
         let mut state = fresh_state();
 
         let plan = make_plan(vec![]);
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert!(results.is_empty());
     }
@@ -1059,6 +1669,7 @@ mod tests {
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1076,6 +1687,10 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1117,7 +1732,7 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_index, 7);
@@ -1156,7 +1771,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![10, 20, 30]);
@@ -1176,7 +1791,7 @@ mod tests {
             parallel: false,
         }]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert!(
             results[0].phase2_stdout.contains("---PLAN---"),
@@ -1214,7 +1829,7 @@ mod tests {
             },
         ]);
 
-        run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         let loaded = state::load_state(&state_dir)
             .unwrap()
@@ -1245,6 +1860,7 @@ mod tests {
             state_dir: state_dir.clone(),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1262,6 +1878,10 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
 
         let mut state = fresh_state();
@@ -1304,7 +1924,7 @@ mod tests {
         ]);
 
         let mut state2 = fresh_state();
-        run_all(&echo, &good_config, &plan2, &mut state2, &state_dir, None).unwrap();
+        run_all(&echo, &good_config, &plan2, &mut state2, &state_dir, None).unwrap().results;
 
         let loaded2 = state::load_state(&state_dir)
             .unwrap()
@@ -1330,7 +1950,7 @@ mod tests {
 
         assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![1, 2, 3], "max_parallel=1 runs block sequentially in order");
     }
@@ -1349,7 +1969,7 @@ mod tests {
         let plan1 = make_plan(vec![
             Task { index: 1, content: "A.".to_owned(), parallel: false },
         ]);
-        run_scheduled(&echo, &config, &plan1, &mut state, &state_dir, None).unwrap();
+        run_scheduled(&echo, &config, &plan1, &mut state, &state_dir, None).unwrap().results;
         assert!(state.is_task_completed(1));
 
         // Run with parallel block (2, 3) that will fail; continue_with_remaining_tasks = true.
@@ -1386,7 +2006,7 @@ mod tests {
             parallel: false,
         }]);
 
-        run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert!(state_dir.join("state.json").exists());
     }
@@ -1421,7 +2041,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![2, 3], "task 1 should be skipped");
@@ -1486,7 +2106,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert!(
             results.is_empty(),
@@ -1530,7 +2150,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![3, 4], "should resume from task 3");
@@ -1565,7 +2185,7 @@ mod tests {
             },
         ]);
 
-        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_all(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert_eq!(results.len(), 2);
         for r in &results {
@@ -1595,8 +2215,15 @@ mod tests {
             parallel: false,
         }]);
 
-        let results =
-            run_all(&echo, &config, &plan, &mut state, &state_dir, Some(&stet)).unwrap();
+        let results = run_all(
+            &echo,
+            &config,
+            &plan,
+            &mut state,
+            &state_dir,
+            Some(stet::StetPhase3Mode::BuiltIn(stet.clone())),
+        )
+        .unwrap().results;
 
         assert_eq!(results.len(), 1);
         let outcome = results[0]
@@ -1641,8 +2268,15 @@ mod tests {
             parallel: false,
         }]);
 
-        let results =
-            run_all(&echo, &config, &plan, &mut state, &state_dir, Some(&stet_script)).unwrap();
+        let results = run_all(
+            &echo,
+            &config,
+            &plan,
+            &mut state,
+            &state_dir,
+            Some(stet::StetPhase3Mode::BuiltIn(stet_script.clone())),
+        )
+        .unwrap().results;
 
         assert_eq!(results.len(), 1);
         let outcome = results[0]
@@ -1681,7 +2315,15 @@ mod tests {
         ]);
 
         let err =
-            run_all(&echo, &config, &plan, &mut state, &state_dir, Some(&bad_stet)).unwrap_err();
+            run_all(
+                &echo,
+                &config,
+                &plan,
+                &mut state,
+                &state_dir,
+                Some(stet::StetPhase3Mode::BuiltIn(bad_stet.clone())),
+            )
+            .unwrap_err();
 
         match err {
             PealError::StetRunFailed { .. } => {}
@@ -1720,7 +2362,7 @@ mod tests {
             vec![Segment::Sequential(1), Segment::Sequential(2), Segment::Sequential(3)]
         );
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![1, 2, 3]);
     }
@@ -1749,7 +2391,7 @@ mod tests {
             ]
         );
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![1, 2, 3, 4]);
 
@@ -1777,7 +2419,7 @@ mod tests {
             Task { index: 4, content: "D.".to_owned(), parallel: false },
         ]);
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![3, 4], "task 2 already done; only 3 and 4 should run");
     }
@@ -1807,7 +2449,7 @@ mod tests {
             vec![Segment::Sequential(1), Segment::Parallel(vec![2, 3, 4])]
         );
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![3, 4], "only pending tasks 3 and 4 in block should run; results in segment order");
 
@@ -1841,7 +2483,7 @@ mod tests {
             vec![Segment::Sequential(1), Segment::Sequential(2), Segment::Sequential(3)]
         );
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![1, 2, 3]);
     }
@@ -1864,7 +2506,7 @@ mod tests {
             Task { index: 3, content: "C.".to_owned(), parallel: true },
         ]);
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         assert!(results.is_empty(), "no tasks should run when all are completed");
     }
 
@@ -1891,6 +2533,7 @@ mod tests {
             state_dir: state_dir.clone(),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1908,6 +2551,10 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
 
         let mut state = fresh_state();
@@ -1940,6 +2587,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn consecutive_task_failures_cap_stops_run_and_persists_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".peal");
+        let mut config = test_config(dir.path());
+        config.agent_cmd = crate::cursor::resolve_agent_cmd("false")
+            .expect("false must exist")
+            .display()
+            .to_string();
+        config.max_consecutive_task_failures = Some(2);
+
+        let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
+        let mut state = fresh_state();
+
+        let plan = make_plan(vec![
+            Task {
+                index: 1,
+                content: "Fails.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 2,
+                content: "Fails.".to_owned(),
+                parallel: false,
+            },
+            Task {
+                index: 3,
+                content: "Not reached.".to_owned(),
+                parallel: false,
+            },
+        ]);
+
+        let err = run_scheduled(&false_path, &config, &plan, &mut state, &state_dir, None)
+            .unwrap_err();
+
+        match &err {
+            PealError::ConsecutiveTaskFailuresCapReached { count, cap } => {
+                assert_eq!(*count, 2);
+                assert_eq!(*cap, 2);
+            }
+            other => panic!("expected ConsecutiveTaskFailuresCapReached, got: {other:?}"),
+        }
+
+        let loaded = state::load_state(&state_dir)
+            .unwrap()
+            .expect("state should be persisted when cap is reached");
+        assert!(
+            loaded.completed_task_indices.is_empty(),
+            "no tasks completed when run stops at cap"
+        );
+    }
+
     // -- SP-5.2 concurrent parallel execution tests --
 
     fn test_config_parallel(repo: &Path) -> PealConfig {
@@ -1965,7 +2664,7 @@ mod tests {
 
         assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert_eq!(results.len(), 3);
         let mut indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
@@ -1995,7 +2694,7 @@ mod tests {
 
         assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![1, 2, 3], "sequential fallback preserves order");
     }
@@ -2020,7 +2719,7 @@ mod tests {
             vec![Segment::Sequential(1), Segment::Sequential(2), Segment::Sequential(3)]
         );
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
         let indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
         assert_eq!(indices, vec![1, 2, 3]);
     }
@@ -2040,7 +2739,7 @@ mod tests {
             Task { index: 3, content: "C.".to_owned(), parallel: true },
         ]);
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert_eq!(results.len(), 3);
         let mut indices: Vec<u32> = results.iter().map(|r| r.task_index).collect();
@@ -2065,7 +2764,7 @@ mod tests {
 
         assert_eq!(plan.segments, vec![Segment::Parallel(vec![1, 2, 3])]);
 
-        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        let results = run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         assert_eq!(results.len(), 3);
         let result_order: Vec<u32> = results.iter().map(|r| r.task_index).collect();
@@ -2090,7 +2789,7 @@ mod tests {
             Task { index: 3, content: "C.".to_owned(), parallel: true },
         ]);
 
-        run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap();
+        run_scheduled(&echo, &config, &plan, &mut state, &state_dir, None).unwrap().results;
 
         let loaded = state::load_state(&state_dir)
             .unwrap()
@@ -2112,7 +2811,7 @@ mod tests {
         let plan_step1 = make_plan(vec![
             Task { index: 1, content: "A.".to_owned(), parallel: false },
         ]);
-        run_scheduled(&echo, &config, &plan_step1, &mut state, &state_dir, None).unwrap();
+        run_scheduled(&echo, &config, &plan_step1, &mut state, &state_dir, None).unwrap().results;
         assert!(state.is_task_completed(1));
 
         // Step 2: run with `false` agent; tasks 2,3 form a parallel block and fail.

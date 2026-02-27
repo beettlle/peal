@@ -8,6 +8,7 @@ pub mod plan;
 pub mod plan_prompt;
 pub mod prompt;
 pub mod runner;
+pub mod run_summary;
 pub mod state;
 pub mod stet;
 pub mod subprocess;

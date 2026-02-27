@@ -17,6 +17,7 @@ const DEFAULT_ON_FINDINGS_REMAINING: &str = "fail";
 const DEFAULT_STATE_DIR: &str = ".peal";
 const DEFAULT_PHASE_TIMEOUT_SEC: u64 = 1800;
 const DEFAULT_PHASE_RETRY_COUNT: u32 = 0;
+const DEFAULT_PHASE_3_RETRY_COUNT: u32 = 0;
 const DEFAULT_NORMALIZE_RETRY_COUNT: u32 = 0;
 const DEFAULT_MAX_PARALLEL: u32 = 4;
 const DEFAULT_ON_STET_FAIL: &str = "fail";
@@ -61,6 +62,8 @@ pub struct PealConfig {
     pub state_dir: PathBuf,
     pub phase_timeout_sec: u64,
     pub phase_retry_count: u32,
+    /// Number of retries for Phase 3 (address findings) Cursor CLI on timeout or non-zero exit. Effective cap 2 at use site.
+    pub phase_3_retry_count: u32,
     pub parallel: bool,
     pub max_parallel: u32,
     /// When true, a task failure in a parallel block does not stop the run:
@@ -95,6 +98,15 @@ pub struct PealConfig {
     pub normalize_retry_count: u32,
     /// Optional path to a file whose content is the full normalization prompt; placeholder `{{DOC}}` is replaced by the plan document. If None, built-in prompt is used.
     pub normalize_prompt_path: Option<PathBuf>,
+    /// When true, validate Phase 1 plan text after capture (non-empty and optionally minimum length). Off by default.
+    pub validate_plan_text: bool,
+    /// When validate_plan_text is true: require plan_text.len() >= this value. If None, only non-empty is required.
+    pub min_plan_text_len: Option<usize>,
+    /// Optional path for run summary JSON. When None, summary is written to state_dir/run_summary.json.
+    pub run_summary_path: Option<PathBuf>,
+    /// When set, run stops after this many consecutive task failures; state is persisted and exit code 3.
+    /// None = cap disabled.
+    pub max_consecutive_task_failures: Option<u32>,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -112,6 +124,7 @@ struct FileConfig {
     state_dir: Option<PathBuf>,
     phase_timeout_sec: Option<u64>,
     phase_retry_count: Option<u32>,
+    phase_3_retry_count: Option<u32>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
     continue_with_remaining_tasks: Option<bool>,
@@ -129,6 +142,10 @@ struct FileConfig {
     normalize_plan: Option<bool>,
     normalize_retry_count: Option<u32>,
     normalize_prompt_path: Option<PathBuf>,
+    validate_plan_text: Option<bool>,
+    min_plan_text_len: Option<u64>,
+    run_summary_path: Option<PathBuf>,
+    max_consecutive_task_failures: Option<u32>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -145,6 +162,7 @@ struct ConfigLayer {
     state_dir: Option<PathBuf>,
     phase_timeout_sec: Option<u64>,
     phase_retry_count: Option<u32>,
+    phase_3_retry_count: Option<u32>,
     parallel: Option<bool>,
     max_parallel: Option<u32>,
     continue_with_remaining_tasks: Option<bool>,
@@ -162,6 +180,10 @@ struct ConfigLayer {
     normalize_plan: Option<bool>,
     normalize_retry_count: Option<u32>,
     normalize_prompt_path: Option<PathBuf>,
+    validate_plan_text: Option<bool>,
+    min_plan_text_len: Option<u64>,
+    run_summary_path: Option<PathBuf>,
+    max_consecutive_task_failures: Option<u32>,
 }
 
 impl PealConfig {
@@ -265,6 +287,9 @@ impl PealConfig {
             phase_retry_count: merged
                 .phase_retry_count
                 .unwrap_or(DEFAULT_PHASE_RETRY_COUNT),
+            phase_3_retry_count: merged
+                .phase_3_retry_count
+                .unwrap_or(DEFAULT_PHASE_3_RETRY_COUNT),
             parallel: {
                 if merged.max_parallel == Some(0) {
                     false
@@ -300,6 +325,12 @@ impl PealConfig {
             .normalize_retry_count
             .unwrap_or(DEFAULT_NORMALIZE_RETRY_COUNT),
         normalize_prompt_path: merged.normalize_prompt_path,
+        validate_plan_text: merged.validate_plan_text.unwrap_or(false),
+        min_plan_text_len: merged
+            .min_plan_text_len
+            .and_then(|u| u.try_into().ok()),
+        run_summary_path: merged.run_summary_path,
+        max_consecutive_task_failures: merged.max_consecutive_task_failures,
     })
     }
 }
@@ -321,6 +352,7 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         state_dir: fc.state_dir,
         phase_timeout_sec: fc.phase_timeout_sec,
         phase_retry_count: fc.phase_retry_count,
+        phase_3_retry_count: fc.phase_3_retry_count,
         parallel: fc.parallel,
         max_parallel: fc.max_parallel,
         continue_with_remaining_tasks: fc.continue_with_remaining_tasks,
@@ -338,6 +370,10 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         normalize_plan: fc.normalize_plan,
         normalize_retry_count: fc.normalize_retry_count,
         normalize_prompt_path: fc.normalize_prompt_path,
+        validate_plan_text: fc.validate_plan_text,
+        min_plan_text_len: fc.min_plan_text_len,
+        run_summary_path: fc.run_summary_path,
+        max_consecutive_task_failures: fc.max_consecutive_task_failures,
     })
 }
 
@@ -381,6 +417,7 @@ fn load_env_layer(
         state_dir: env_fn("STATE_DIR").map(PathBuf::from),
         phase_timeout_sec: parse_env_u64(env_fn, "PHASE_TIMEOUT_SEC")?,
         phase_retry_count: parse_env_u32(env_fn, "PHASE_RETRY_COUNT")?,
+        phase_3_retry_count: parse_env_u32(env_fn, "PHASE_3_RETRY_COUNT")?,
         parallel: parse_env_bool(env_fn, "PARALLEL")?,
         max_parallel: parse_env_u32(env_fn, "MAX_PARALLEL")?,
         continue_with_remaining_tasks: parse_env_bool(env_fn, "CONTINUE_WITH_REMAINING_TASKS")?,
@@ -403,6 +440,10 @@ fn load_env_layer(
         normalize_plan: parse_env_bool(env_fn, "NORMALIZE_PLAN")?,
         normalize_retry_count: parse_env_u32(env_fn, "NORMALIZE_RETRY_COUNT")?,
         normalize_prompt_path: env_fn("NORMALIZE_PROMPT_PATH").map(PathBuf::from),
+        validate_plan_text: parse_env_bool(env_fn, "VALIDATE_PLAN_TEXT")?,
+        min_plan_text_len: parse_env_u64(env_fn, "MIN_PLAN_TEXT_LEN")?,
+        run_summary_path: env_fn("RUN_SUMMARY_PATH").map(PathBuf::from),
+        max_consecutive_task_failures: parse_env_u32(env_fn, "MAX_CONSECUTIVE_TASK_FAILURES")?,
     })
 }
 
@@ -506,6 +547,7 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         state_dir: args.state_dir.clone(),
         phase_timeout_sec: args.phase_timeout_sec,
         phase_retry_count: args.phase_retry_count,
+        phase_3_retry_count: args.phase_3_retry_count,
         parallel: if args.parallel { Some(true) } else { None },
         max_parallel: args.max_parallel,
         continue_with_remaining_tasks: if args.continue_with_remaining_tasks {
@@ -536,6 +578,10 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         normalize_plan: if args.normalize { Some(true) } else { None },
         normalize_retry_count: args.normalize_retry_count,
         normalize_prompt_path: None,
+        validate_plan_text: if args.validate_plan_text { Some(true) } else { None },
+        min_plan_text_len: args.min_plan_text_len,
+        run_summary_path: args.run_summary_path.clone(),
+        max_consecutive_task_failures: args.max_consecutive_task_failures,
     }
 }
 
@@ -568,6 +614,10 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .phase_retry_count
             .or(env.phase_retry_count)
             .or(file.phase_retry_count),
+        phase_3_retry_count: cli
+            .phase_3_retry_count
+            .or(env.phase_3_retry_count)
+            .or(file.phase_3_retry_count),
         parallel: cli.parallel.or(env.parallel).or(file.parallel),
         max_parallel: cli.max_parallel.or(env.max_parallel).or(file.max_parallel),
         continue_with_remaining_tasks: cli
@@ -615,6 +665,22 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .normalize_prompt_path
             .or(env.normalize_prompt_path)
             .or(file.normalize_prompt_path),
+        validate_plan_text: cli
+            .validate_plan_text
+            .or(env.validate_plan_text)
+            .or(file.validate_plan_text),
+        min_plan_text_len: cli
+            .min_plan_text_len
+            .or(env.min_plan_text_len)
+            .or(file.min_plan_text_len),
+        run_summary_path: cli
+            .run_summary_path
+            .or(env.run_summary_path)
+            .or(file.run_summary_path),
+        max_consecutive_task_failures: cli
+            .max_consecutive_task_failures
+            .or(env.max_consecutive_task_failures)
+            .or(file.max_consecutive_task_failures),
     }
 }
 
@@ -639,6 +705,7 @@ mod tests {
             state_dir: None,
             phase_timeout_sec: None,
             phase_retry_count: None,
+            phase_3_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
@@ -656,6 +723,10 @@ mod tests {
             stet_disable_llm_triage: None,
             post_run_commands: None,
             post_run_timeout_sec: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         }
     }
 
@@ -676,6 +747,61 @@ mod tests {
         assert_eq!(cfg.phase_timeout_sec, 1800);
         assert!(!cfg.parallel);
         assert_eq!(cfg.max_parallel, 4);
+    }
+
+    #[test]
+    fn validate_plan_text_defaults_off() {
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert!(!cfg.validate_plan_text);
+        assert_eq!(cfg.min_plan_text_len, None);
+    }
+
+    #[test]
+    fn validate_plan_text_and_min_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+validate_plan_text = true
+min_plan_text_len = 500
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert!(cfg.validate_plan_text);
+        assert_eq!(cfg.min_plan_text_len, Some(500));
+    }
+
+    #[test]
+    fn validate_plan_text_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            match suffix {
+                "VALIDATE_PLAN_TEXT" => Some("true".to_owned()),
+                "MIN_PLAN_TEXT_LEN" => Some("100".to_owned()),
+                _ => None,
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert!(cfg.validate_plan_text);
+        assert_eq!(cfg.min_plan_text_len, Some(100));
+    }
+
+    #[test]
+    fn validate_plan_text_from_cli() {
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.validate_plan_text = true;
+        args.min_plan_text_len = Some(200);
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert!(cfg.validate_plan_text);
+        assert_eq!(cfg.min_plan_text_len, Some(200));
     }
 
     #[test]
@@ -832,6 +958,7 @@ model = "from-file"
             state_dir: None,
             phase_timeout_sec: None,
             phase_retry_count: None,
+            phase_3_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
@@ -849,6 +976,10 @@ model = "from-file"
             stet_disable_llm_triage: None,
             post_run_commands: None,
             post_run_timeout_sec: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
 
@@ -907,6 +1038,7 @@ agent_cmd = "from-file"
             state_dir: None,
             phase_timeout_sec: None,
             phase_retry_count: None,
+            phase_3_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
@@ -924,6 +1056,10 @@ agent_cmd = "from-file"
             stet_disable_llm_triage: None,
             post_run_commands: None,
             post_run_timeout_sec: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
 
@@ -1007,6 +1143,7 @@ bogus_key = true
             state_dir: None,
             phase_timeout_sec: None,
             phase_retry_count: None,
+            phase_3_retry_count: None,
             parallel: false,
             max_parallel: Some(2),
             continue_with_remaining_tasks: false,
@@ -1024,6 +1161,10 @@ bogus_key = true
             stet_disable_llm_triage: None,
             post_run_commands: None,
             post_run_timeout_sec: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
 
@@ -1058,8 +1199,8 @@ bogus_key = true
         let err = cfg.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("does not exist") || msg.contains("Invalid or missing plan file"),
-            "expected 'does not exist' or 'Invalid or missing plan file', got: {msg}"
+            msg.contains("Invalid or missing plan file."),
+            "expected 'Invalid or missing plan file.', got: {msg}"
         );
     }
 
@@ -1075,8 +1216,8 @@ bogus_key = true
         let err = cfg.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("Invalid or missing plan file"),
-            "expected 'Invalid or missing plan file', got: {msg}"
+            msg.contains("Invalid or missing plan file."),
+            "expected 'Invalid or missing plan file.', got: {msg}"
         );
     }
 
@@ -1215,6 +1356,7 @@ sandbox = "file-sandbox"
             state_dir: None,
             phase_timeout_sec: None,
             phase_retry_count: None,
+            phase_3_retry_count: None,
             parallel: false,
             max_parallel: None,
             continue_with_remaining_tasks: false,
@@ -1232,6 +1374,10 @@ sandbox = "file-sandbox"
             stet_disable_llm_triage: None,
             post_run_commands: None,
             post_run_timeout_sec: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
 
@@ -1560,6 +1706,55 @@ normalize_retry_count = 2
     }
 
     #[test]
+    fn phase_3_retry_count_defaults_to_zero() {
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert_eq!(cfg.phase_3_retry_count, 0);
+    }
+
+    #[test]
+    fn phase_3_retry_count_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+phase_3_retry_count = 2
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert_eq!(cfg.phase_3_retry_count, 2);
+    }
+
+    #[test]
+    fn phase_3_retry_count_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "PHASE_3_RETRY_COUNT" {
+                Some("1".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert_eq!(cfg.phase_3_retry_count, 1);
+    }
+
+    #[test]
+    fn phase_3_retry_count_from_cli() {
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.phase_3_retry_count = Some(2);
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert_eq!(cfg.phase_3_retry_count, 2);
+    }
+
+    #[test]
     fn normalize_prompt_path_from_toml() {
         let dir = tempfile::tempdir().unwrap();
         let prompt_path = dir.path().join("custom-prompt.txt");
@@ -1623,5 +1818,126 @@ normalize_prompt_path = "{}"
             vec!["stet finish", "echo done"]
         );
         assert_eq!(cfg.post_run_timeout_sec, Some(120));
+    }
+
+    #[test]
+    fn run_summary_path_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary_path = dir.path().join("summary.json");
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                r#"
+plan_path = "p.md"
+repo_path = "/r"
+run_summary_path = "{}"
+"#,
+                summary_path.display()
+            ),
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert_eq!(cfg.run_summary_path.as_deref(), Some(summary_path.as_path()));
+    }
+
+    #[test]
+    fn run_summary_path_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "RUN_SUMMARY_PATH" {
+                Some("/tmp/peal-summary.json".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert_eq!(
+            cfg.run_summary_path.as_deref(),
+            Some(std::path::Path::new("/tmp/peal-summary.json"))
+        );
+    }
+
+    #[test]
+    fn run_summary_path_from_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom.json");
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.run_summary_path = Some(custom.clone());
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert_eq!(cfg.run_summary_path.as_deref(), Some(custom.as_path()));
+    }
+
+    #[test]
+    fn max_consecutive_task_failures_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+max_consecutive_task_failures = 3
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert_eq!(cfg.max_consecutive_task_failures, Some(3));
+    }
+
+    #[test]
+    fn max_consecutive_task_failures_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "MAX_CONSECUTIVE_TASK_FAILURES" {
+                Some("5".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert_eq!(cfg.max_consecutive_task_failures, Some(5));
+    }
+
+    #[test]
+    fn max_consecutive_task_failures_from_cli() {
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.max_consecutive_task_failures = Some(2);
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert_eq!(cfg.max_consecutive_task_failures, Some(2));
+    }
+
+    #[test]
+    fn max_consecutive_task_failures_precedence_cli_over_env_over_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+max_consecutive_task_failures = 10
+"#,
+        )
+        .unwrap();
+
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "MAX_CONSECUTIVE_TASK_FAILURES" {
+                Some("7".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let mut args = minimal_cli_args(None, None);
+        args.max_consecutive_task_failures = Some(2);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
+        assert_eq!(cfg.max_consecutive_task_failures, Some(2), "CLI wins");
     }
 }

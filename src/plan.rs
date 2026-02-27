@@ -163,6 +163,7 @@ pub fn parse_plan_or_fail_with_snippet(normalized: &str) -> Result<ParsedPlan, P
 }
 
 /// Build argv for the normalization invocation (same layout as Phase 1).
+/// `--model` is only added when `config.model` is set; otherwise omitted for Cursor CLI default (Auto).
 fn normalization_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
     let mut args = vec![
         "--print".to_owned(),
@@ -172,9 +173,10 @@ fn normalization_argv(config: &PealConfig, prompt: &str) -> Vec<String> {
         "--output-format".to_owned(),
         "text".to_owned(),
     ];
-    let model = config.model.as_deref().unwrap_or("auto");
-    args.push("--model".to_owned());
-    args.push(model.to_owned());
+    if let Some(model) = &config.model {
+        args.push("--model".to_owned());
+        args.push(model.clone());
+    }
     args.push(prompt.to_owned());
     args
 }
@@ -415,6 +417,30 @@ mod tests {
         let doc = "my document";
         let prompt = build_normalize_prompt(doc, &config).unwrap();
         assert_eq!(prompt, prompt::normalize_plan_prompt(doc));
+    }
+
+    #[test]
+    fn normalization_argv_without_model_omits_model() {
+        let config = minimal_config_for_normalize(None);
+        let args = normalization_argv(&config, "Normalize this.");
+        assert!(
+            !args.contains(&"--model".to_owned()),
+            "when model is unset, argv must not contain --model"
+        );
+        assert!(
+            !args.contains(&"auto".to_owned()),
+            "when model is unset, argv must not contain auto"
+        );
+        assert_eq!(args.last(), Some(&"Normalize this.".to_owned()));
+    }
+
+    #[test]
+    fn normalization_argv_with_model_includes_model() {
+        let mut config = minimal_config_for_normalize(None);
+        config.model = Some("claude-4-opus".to_owned());
+        let args = normalization_argv(&config, "Normalize this.");
+        let pos = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args.get(pos + 1), Some(&"claude-4-opus".to_owned()));
     }
 
     #[test]
@@ -866,8 +892,8 @@ G
         let err = parse_plan_file(&path).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("Invalid or missing plan file") || msg.contains("invalid utf-8"),
-            "expected UTF-8 rejection, got: {msg}"
+            msg.contains("Invalid or missing plan file."),
+            "expected UTF-8 rejection (Invalid or missing plan file.), got: {msg}"
         );
     }
 
@@ -876,8 +902,8 @@ G
         let err = parse_plan_file(Path::new("/no/such/file.md")).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("does not exist") || msg.contains("Invalid or missing plan file"),
-            "expected file-not-found error, got: {msg}"
+            msg.contains("Invalid or missing plan file."),
+            "expected file-not-found error (Invalid or missing plan file.), got: {msg}"
         );
     }
 

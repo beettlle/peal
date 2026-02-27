@@ -13,6 +13,7 @@ use peal::cursor;
 use peal::plan;
 use peal::plan_prompt;
 use peal::runner;
+use peal::run_summary;
 use peal::state;
 use peal::stet;
 
@@ -20,15 +21,38 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(CommandOutcome::PromptOk) => ExitCode::SUCCESS,
+        Ok(CommandOutcome::RunOk { has_issues, .. }) => {
+            if has_issues {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Err(e) => {
             error!("{e:#}");
-            ExitCode::FAILURE
+            let exit_code = if e.downcast_ref::<peal::error::PealError>()
+                .is_some_and(|pe| matches!(pe, peal::error::PealError::ConsecutiveTaskFailuresCapReached { .. }))
+            {
+                3
+            } else {
+                1
+            };
+            ExitCode::from(exit_code)
         }
     }
 }
 
-fn run(cli: Cli) -> anyhow::Result<()> {
+/// Result of a successful run: Prompt has no summary; Run carries outcome and has_issues for exit code.
+pub enum CommandOutcome {
+    PromptOk,
+    RunOk {
+        outcome: runner::RunOutcome,
+        has_issues: bool,
+    },
+}
+
+fn run(cli: Cli) -> anyhow::Result<CommandOutcome> {
     match cli.command {
         Commands::Prompt(args) => {
             let prompt = plan_prompt::plan_instructions_prompt();
@@ -41,7 +65,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => println!("{prompt}"),
             }
-            Ok(())
+            Ok(CommandOutcome::PromptOk)
         }
         Commands::Run(args) => {
             let config_path = args.config.clone();
@@ -59,8 +83,96 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None => info!("stet not found, phase 3 will be skipped"),
             }
 
-            let mut run_stet_path = stet_path.clone();
-            if let Some(ref sp) = stet_path {
+            let phase3_mode: Option<stet::StetPhase3Mode> = if !config.stet_commands.is_empty() {
+                info!(count = config.stet_commands.len(), "running custom stet_commands at session start");
+                let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
+                let mut session_ok = true;
+                for (i, cmd) in config.stet_commands.iter().enumerate() {
+                    let cmd = cmd.trim();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    info!(index = i + 1, command = %cmd, "running stet_commands entry");
+                    let result = match peal::subprocess::run_command_string(cmd, &config.repo_path, timeout) {
+                        None => continue,
+                        Some(Ok(r)) => r,
+                        Some(Err(e)) => {
+                            let err = peal::error::PealError::StetStartFailed {
+                                detail: format!("spawn failed: {e}"),
+                            };
+                            if config.on_stet_fail == "retry_once" {
+                                warn!(err = %e, "custom stet command spawn failed, retrying once");
+                                match peal::subprocess::run_command_string(cmd, &config.repo_path, timeout) {
+                                    Some(Ok(r)) => r,
+                                    _ => return Err(err.into()),
+                                }
+                            } else if config.on_stet_fail == "skip" {
+                                warn!(err = %e, "custom stet command failed; stet phase skipped for this run");
+                                session_ok = false;
+                                continue;
+                            } else {
+                                return Err(err.into());
+                            }
+                        }
+                    };
+                    if result.timed_out {
+                        let err = peal::error::PealError::StetStartFailed {
+                            detail: "custom stet command timed out".to_owned(),
+                        };
+                        if config.on_stet_fail == "retry_once" {
+                            warn!("custom stet command timed out, retrying once");
+                            if let Some(Ok(r)) =
+                                peal::subprocess::run_command_string(cmd, &config.repo_path, timeout)
+                            {
+                                if r.timed_out {
+                                    return Err(peal::error::PealError::StetStartFailed {
+                                        detail: "custom stet command timed out (retry)".to_owned(),
+                                    }
+                                    .into());
+                                }
+                            } else {
+                                return Err(err.into());
+                            }
+                        } else if config.on_stet_fail == "skip" {
+                            warn!("custom stet command timed out; stet phase skipped for this run");
+                            session_ok = false;
+                            continue;
+                        } else {
+                            return Err(err.into());
+                        }
+                    } else if !result.success() && config.on_stet_fail == "fail" {
+                        return Err(peal::error::PealError::StetStartFailed {
+                            detail: format!("exit code {:?}: {}", result.exit_code, result.stderr.trim()),
+                        }.into());
+                    } else if !result.success() && config.on_stet_fail == "skip" {
+                        warn!(exit_code = ?result.exit_code, "custom stet command failed; stet phase skipped for this run");
+                        session_ok = false;
+                        continue;
+                    } else if !result.success() && config.on_stet_fail == "retry_once" {
+                        warn!(exit_code = ?result.exit_code, "custom stet command failed, retrying once");
+                        if let Some(Ok(r)) =
+                            peal::subprocess::run_command_string(cmd, &config.repo_path, timeout)
+                        {
+                            if !r.success() {
+                                return Err(peal::error::PealError::StetStartFailed {
+                                    detail: format!("exit code {:?}: {}", r.exit_code, r.stderr.trim()),
+                                }
+                                .into());
+                            }
+                        } else {
+                            return Err(peal::error::PealError::StetStartFailed {
+                                detail: "custom stet command failed on retry".to_owned(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+                if session_ok {
+                    Some(stet::StetPhase3Mode::CustomCommands(config.stet_commands.clone()))
+                } else {
+                    None
+                }
+            } else if let Some(ref sp) = stet_path {
                 info!("starting stet session");
                 let start_result = match config.on_stet_fail.as_str() {
                     "retry_once" => {
@@ -91,13 +203,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         &config.repo_path,
                         Some(Duration::from_secs(config.phase_timeout_sec)),
                     )
+                    .map(|_| Some(sp.clone()))
                     .or_else(|e| {
                         warn!(err = %e, "stet start failed; stet phase skipped for this run");
-                        run_stet_path = None;
-                        Ok(stet::StetOutput {
-                            stdout: String::new(),
-                            stderr: String::new(),
-                        })
+                        Ok(None)
                     }),
                     _ => stet::start_session(
                         sp,
@@ -105,17 +214,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         &config.stet_start_extra_args,
                         &config.repo_path,
                         Some(Duration::from_secs(config.phase_timeout_sec)),
-                    ),
+                    ).map(|_| Some(sp.clone())),
                 };
-                let stet_out = start_result?;
-                if run_stet_path.is_some() {
-                    info!(
-                        stdout_len = stet_out.stdout.len(),
-                        stderr_len = stet_out.stderr.len(),
-                        "stet session started"
-                    );
+                match start_result {
+                    Ok(Some(path)) => {
+                        info!("stet session started");
+                        Some(stet::StetPhase3Mode::BuiltIn(path))
+                    }
+                    Ok(None) => None,
+                    Err(e) => return Err(e.into()),
                 }
-            }
+            } else {
+                None
+            };
 
             info!(
                 plan = %config.plan_path.display(),
@@ -238,16 +349,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
+            let finish_path = phase3_mode.as_ref().and_then(|m| match m {
+                stet::StetPhase3Mode::BuiltIn(p) => Some(p.clone()),
+                stet::StetPhase3Mode::CustomCommands(_) => None,
+            });
+
             let run_result = runner::run_scheduled(
                 &agent_path,
                 &config,
                 &parsed,
                 &mut peal_state,
                 &config.state_dir,
-                run_stet_path.as_deref(),
+                phase3_mode,
             );
 
-            if let Some(ref sp) = run_stet_path {
+            if let Some(ref sp) = finish_path {
                 let timeout = Some(Duration::from_secs(config.phase_timeout_sec));
                 match stet::finish_session(sp, &config.repo_path, timeout) {
                     Ok(out) => info!(
@@ -259,7 +375,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
 
-            let results = run_result?;
+            let outcome = run_result?;
+            let results = &outcome.results;
 
             if !config.post_run_commands.is_empty() {
                 let timeout = config
@@ -325,7 +442,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
 
-            for r in &results {
+            for r in results {
                 info!(
                     task_index = r.task_index,
                     plan_text_len = r.plan_text.len(),
@@ -336,7 +453,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
-            Ok(())
+            let has_issues = !outcome.failed_task_indices.is_empty()
+                || results
+                    .iter()
+                    .any(|r| r.phase3_outcome.as_ref().map_or(false, |o| !o.findings_resolved));
+
+            let exit_code = if has_issues { 2 } else { 0 };
+            let summary = run_summary::build_summary(&outcome, &config, exit_code);
+            let summary_path = run_summary::summary_path(&config);
+            run_summary::write_run_summary(&summary, &summary_path);
+
+            Ok(CommandOutcome::RunOk {
+                outcome,
+                has_issues,
+            })
         }
     }
 }
@@ -361,8 +491,40 @@ mod tests {
         let result = run(cli);
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("Invalid or missing plan file"),
-            "expected 'Invalid or missing plan file', got: {err_msg}"
+            err_msg.contains("Invalid or missing plan file."),
+            "expected 'Invalid or missing plan file.', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn run_no_summary_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "No ## Task headings.\n").unwrap();
+        let state_dir = dir.path().join(".peal");
+
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "echo",
+            "--stet-path",
+            "/nonexistent",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let result = run(cli);
+        result.unwrap_err();
+        assert!(
+            !state_dir.join("run_summary.json").exists(),
+            "run summary must not be written on hard failure"
         );
     }
 
@@ -394,8 +556,8 @@ mod tests {
         let result = run(cli);
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("Invalid or missing plan file"),
-            "expected 'Invalid or missing plan file', got: {err_msg}"
+            err_msg.contains("Invalid or missing plan file."),
+            "expected 'Invalid or missing plan file.', got: {err_msg}"
         );
     }
 
@@ -461,6 +623,7 @@ mod tests {
         let plan_path = dir.path().join("plan.md");
         fs::write(&plan_path, "## Task 1\nDo something").unwrap();
 
+        let state_dir = dir.path().join(".peal");
         let cli = Cli::try_parse_from([
             "peal",
             "run",
@@ -472,10 +635,55 @@ mod tests {
             "echo",
             "--stet-path",
             "/nonexistent",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
         ])
         .unwrap();
 
-        run(cli).expect("should succeed with valid plan file and repo directory");
+        let outcome = run(cli).expect("should succeed with valid plan file and repo directory");
+        match &outcome {
+            CommandOutcome::RunOk { has_issues, .. } => assert!(!has_issues, "clean run should have has_issues false"),
+            CommandOutcome::PromptOk => panic!("expected RunOk"),
+        }
+
+        let summary_path = state_dir.join("run_summary.json");
+        assert!(summary_path.exists(), "run summary should be written on success");
+        let content = fs::read_to_string(&summary_path).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(summary.get("tasks_completed").is_some());
+        assert_eq!(summary["tasks_completed"], serde_json::json!([1]));
+        assert_eq!(summary["exit_code"], 0);
+    }
+
+    #[test]
+    fn run_summary_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().ok();
+        let plan_path = dir.path().join("plan.md");
+        fs::write(&plan_path, "## Task 1\nDo something").unwrap();
+
+        let custom_summary = dir.path().join("custom_run_summary.json");
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--agent-cmd",
+            "echo",
+            "--stet-path",
+            "/nonexistent",
+            "--run-summary-path",
+            custom_summary.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        run(cli).expect("run should succeed");
+        assert!(custom_summary.exists(), "summary should be written to override path");
+        let content = fs::read_to_string(&custom_summary).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(summary["tasks_completed"], serde_json::json!([1]));
     }
 
     /// Canonical plan with --normalize: no normalization call; parse directly and run.

@@ -232,6 +232,27 @@ pub struct StetRunResult {
     pub has_findings: bool,
 }
 
+/// Build a `StetRunResult` from raw command output using the same findings heuristic as `run_review`.
+/// Used when phase 3 runs a custom command (e.g. `stet_commands` last entry) instead of built-in `stet run`.
+pub fn run_result_from_output(stdout: String, stderr: String, exit_code: Option<i32>) -> StetRunResult {
+    let has_findings = detect_findings(exit_code, &stdout);
+    StetRunResult {
+        stdout,
+        stderr,
+        exit_code,
+        has_findings,
+    }
+}
+
+/// How phase 3 (stet review + address) is driven: built-in stet binary or custom command list.
+#[derive(Debug, Clone)]
+pub enum StetPhase3Mode {
+    /// Use the stet binary at the given path; start/run/finish use built-in sequence.
+    BuiltIn(PathBuf),
+    /// Use custom commands: session start = all commands run once by main; per-task run = last command only; no built-in finish.
+    CustomCommands(Vec<String>),
+}
+
 /// Run an incremental stet review by invoking `stet run --output=json [extra_args...]` in `repo_path`.
 ///
 /// Peal always passes `--output=json` so stdout is machine-readable; `extra_args` are appended
@@ -288,6 +309,54 @@ pub fn run_review(
         "stet run completed"
     );
 
+    Ok(StetRunResult {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: result.exit_code,
+        has_findings,
+    })
+}
+
+/// Run a single command string (e.g. the last entry of `stet_commands`) and return a `StetRunResult`.
+/// CWD = `repo_path`; timeout applied. Spawn failure or timeout returns `PealError::StetRunFailed`.
+/// Used when phase 3 uses custom commands instead of the built-in stet binary.
+pub fn run_review_via_command(
+    command: &str,
+    repo_path: &Path,
+    timeout: Option<Duration>,
+) -> Result<StetRunResult, PealError> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err(PealError::StetRunFailed {
+            detail: "custom run command is empty".to_owned(),
+        });
+    }
+    let result = match subprocess::run_command_string(trimmed, repo_path, timeout) {
+        None => {
+            return Err(PealError::StetRunFailed {
+                detail: "custom run command is empty".to_owned(),
+            });
+        }
+        Some(Err(e)) => {
+            return Err(PealError::StetRunFailed {
+                detail: format!("spawn failed: {e}"),
+            });
+        }
+        Some(Ok(r)) => r,
+    };
+    if result.timed_out {
+        return Err(PealError::StetRunFailed {
+            detail: "timed out".to_owned(),
+        });
+    }
+    let has_findings = detect_findings(result.exit_code, &result.stdout);
+    info!(
+        exit_code = ?result.exit_code,
+        has_findings,
+        stdout_len = result.stdout.len(),
+        stderr_len = result.stderr.len(),
+        "custom stet run command completed"
+    );
     Ok(StetRunResult {
         stdout: result.stdout,
         stderr: result.stderr,
@@ -517,17 +586,25 @@ pub fn dismiss_non_actionable_and_rerun(
     config: &PealConfig,
     run_stdout: &str,
 ) -> Result<StetRunResult, PealError> {
-    let findings = match parse_findings_from_run_json(run_stdout) {
-        Some(f) if !f.is_empty() => f,
-        _ => {
-            return run_review(
-                stet_path,
-                &config.repo_path,
-                &config.stet_run_extra_args,
-                Some(Duration::from_secs(config.phase_timeout_sec)),
-            );
-        }
-    };
+    let parsed = parse_findings_from_run_json(run_stdout);
+    if parsed.is_none() {
+        warn!("stet run output was not valid JSON or had no findings array; skipping structured dismiss");
+        return run_review(
+            stet_path,
+            &config.repo_path,
+            &config.stet_run_extra_args,
+            Some(Duration::from_secs(config.phase_timeout_sec)),
+        );
+    }
+    let findings = parsed.unwrap();
+    if findings.is_empty() {
+        return run_review(
+            stet_path,
+            &config.repo_path,
+            &config.stet_run_extra_args,
+            Some(Duration::from_secs(config.phase_timeout_sec)),
+        );
+    }
 
     let to_dismiss: Vec<(String, String)> = if config.stet_disable_llm_triage {
         triage_by_patterns(&findings, &config.stet_dismiss_patterns)
@@ -716,6 +793,82 @@ pub fn address_loop(
             task_index,
             rounds = config.max_address_rounds,
             "findings remain after all address rounds; continuing (on_findings_remaining=warn)"
+        );
+        return Ok(AddressLoopOutcome {
+            rounds_used: config.max_address_rounds,
+            findings_resolved: false,
+            last_stet_result: current_result,
+        });
+    }
+
+    Err(PealError::StetFindingsRemain {
+        task_index,
+        rounds: config.max_address_rounds,
+        remaining_count: count_findings(&current_result.stdout),
+        commit_hash: resolve_head_commit(&config.repo_path),
+        stet_review: format!(
+            "stdout:\n{}\nstderr:\n{}",
+            current_result.stdout, current_result.stderr
+        ),
+    })
+}
+
+/// Address loop for custom commands: no dismiss step; after each round we re-run the last command only.
+/// `run_last_command` is typically a closure that runs the last entry of `stet_commands` via `run_review_via_command`.
+pub fn address_loop_custom<F>(
+    agent_path: &Path,
+    config: &PealConfig,
+    task_index: u32,
+    initial_result: &StetRunResult,
+    run_last_command: F,
+) -> Result<AddressLoopOutcome, PealError>
+where
+    F: Fn() -> Result<StetRunResult, PealError>,
+{
+    if !initial_result.has_findings {
+        return Ok(AddressLoopOutcome {
+            rounds_used: 0,
+            findings_resolved: true,
+            last_stet_result: initial_result.clone(),
+        });
+    }
+
+    let mut current_result = initial_result.clone();
+
+    for round in 1..=config.max_address_rounds {
+        info!(
+            task_index,
+            round,
+            max_rounds = config.max_address_rounds,
+            "address loop (custom): starting round"
+        );
+
+        address_findings(agent_path, config, task_index, &current_result)?;
+
+        let new_result = run_last_command()?;
+
+        if !new_result.has_findings {
+            info!(task_index, round, "address loop (custom): findings resolved");
+            return Ok(AddressLoopOutcome {
+                rounds_used: round,
+                findings_resolved: true,
+                last_stet_result: new_result,
+            });
+        }
+
+        info!(
+            task_index,
+            round,
+            "address loop (custom): findings still present after round"
+        );
+        current_result = new_result;
+    }
+
+    if config.on_findings_remaining == "warn" {
+        warn!(
+            task_index,
+            rounds = config.max_address_rounds,
+            "findings remain after all address rounds (custom); continuing (on_findings_remaining=warn)"
         );
         return Ok(AddressLoopOutcome {
             rounds_used: config.max_address_rounds,

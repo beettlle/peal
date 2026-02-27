@@ -3,6 +3,10 @@
 //! Validates that the configured `agent_cmd` binary is reachable before
 //! any subprocess invocation, providing a clear error with install link
 //! when the command is missing.
+//!
+//! **Windows:** For bare names with no extension (e.g. `agent`), resolution
+//! tries `.exe` in each PATH directory so that `agent` finds `agent.exe`.
+//! Explicit paths with no extension are tried once with `.exe` appended.
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +15,11 @@ use crate::error::PealError;
 /// Resolve `agent_cmd` to an absolute path on the system.
 ///
 /// - If `cmd` contains a path separator it is treated as an explicit path
-///   and checked directly.
-/// - Otherwise the function searches each directory in `PATH`.
+///   and checked directly (on Windows, if the path has no extension, `.exe`
+///   is tried once).
+/// - Otherwise the function searches each directory in `PATH`. On Windows,
+///   a bare name with no extension is resolved by trying that name plus `.exe`
+///   in each PATH directory.
 ///
 /// Returns the first matching file path, or `PealError::AgentCmdNotFound`
 /// with an install link when the binary cannot be located.
@@ -30,6 +37,15 @@ fn resolve_agent_cmd_with(
         if is_executable(&p) {
             return Ok(p);
         }
+        #[cfg(windows)]
+        {
+            if p.extension().is_none() {
+                let with_exe = p.with_extension("exe");
+                if is_executable(&with_exe) {
+                    return Ok(with_exe);
+                }
+            }
+        }
         return Err(PealError::AgentCmdNotFound {
             cmd: cmd.to_owned(),
         });
@@ -37,9 +53,26 @@ fn resolve_agent_cmd_with(
 
     if let Some(paths) = path_var {
         for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(cmd);
-            if is_executable(&candidate) {
-                return Ok(candidate);
+            #[cfg(unix)]
+            {
+                let candidate = dir.join(cmd);
+                if is_executable(&candidate) {
+                    return Ok(candidate);
+                }
+            }
+            #[cfg(windows)]
+            {
+                let has_ext = Path::new(cmd).extension().is_some();
+                let candidates: Vec<PathBuf> = if has_ext {
+                    vec![dir.join(cmd)]
+                } else {
+                    vec![dir.join(cmd), dir.join(format!("{}.exe", cmd))]
+                };
+                for candidate in candidates {
+                    if is_executable(&candidate) {
+                        return Ok(candidate);
+                    }
+                }
             }
         }
     }
@@ -184,5 +217,18 @@ mod tests {
             result.is_err(),
             "file without execute permission should be skipped"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_bare_name_to_exe_in_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("agent.exe");
+        std::fs::write(&exe_path, "").unwrap();
+
+        let path_var = OsString::from(dir.path().as_os_str());
+        let result = resolve_agent_cmd_with("agent", Some(path_var));
+        let path = result.expect("should resolve 'agent' to agent.exe in PATH");
+        assert_eq!(path, exe_path);
     }
 }

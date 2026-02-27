@@ -8,9 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::error::PealError;
 
 /// Persistent state for a peal run, serialized to `.peal/state.json`.
+/// In v1, state is persisted as JSON only; PRD §10 permits TOML or JSON.
 ///
 /// Tracks which tasks have been completed so that interrupted runs can resume.
 /// This struct is pure data + serialization; file I/O lives in a separate module.
+///
+/// The optional fields `last_plan_by_task` and `last_completed_ref` are reserved
+/// for future use (e.g. re-running phase 2 without phase 1, or ref-based reporting).
+/// They are not yet populated by the runner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PealState {
     /// Path to the plan file driving this run.
@@ -23,11 +28,13 @@ pub struct PealState {
     pub completed_task_indices: Vec<u32>,
 
     /// Plan text produced by Phase 1, keyed by task index.
+    /// Reserved for future use (e.g. re-run phase 2 without phase 1). Not yet populated by the runner.
     /// `BTreeMap` keeps JSON keys in deterministic order.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_plan_by_task: Option<BTreeMap<u32, String>>,
 
     /// A git ref or timestamp marking the last successful completion point.
+    /// Reserved for future use (e.g. ref-based reporting). Not yet populated by the runner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_completed_ref: Option<String>,
 }

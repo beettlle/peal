@@ -34,6 +34,7 @@ pub struct PromptArgs {
 ///
 /// `--plan` and `--repo` can also be set via config file or env vars
 /// (`PEAL_PLAN_PATH`, `PEAL_REPO_PATH`). Precedence: CLI > env > file.
+/// Re-running with the same --plan and --repo resumes from the last completed task.
 #[derive(Debug, Clone, clap::Args)]
 pub struct RunArgs {
     /// Path to the markdown plan file.
@@ -79,6 +80,10 @@ pub struct RunArgs {
     /// Number of retries per phase on timeout or non-zero exit (default: 0).
     #[arg(long)]
     pub phase_retry_count: Option<u32>,
+
+    /// Number of retries for Phase 3 (address findings) Cursor CLI on timeout or non-zero exit (default: 0, max 2).
+    #[arg(long)]
+    pub phase_3_retry_count: Option<u32>,
 
     /// Enable parallel execution of parallel-marked tasks.
     #[arg(long, default_value_t = false)]
@@ -153,6 +158,22 @@ pub struct RunArgs {
     /// Timeout in seconds for each post-run command. When omitted, phase timeout is used.
     #[arg(long)]
     pub post_run_timeout_sec: Option<u64>,
+
+    /// Validate Phase 1 plan text (non-empty and optionally minimum length). Off by default.
+    #[arg(long, default_value_t = false)]
+    pub validate_plan_text: bool,
+
+    /// When --validate-plan-text is set: require plan text length >= this value.
+    #[arg(long)]
+    pub min_plan_text_len: Option<u64>,
+
+    /// Path for run summary JSON. When omitted, summary is written to state_dir/run_summary.json.
+    #[arg(long)]
+    pub run_summary_path: Option<PathBuf>,
+
+    /// Stop run after this many consecutive task failures; state is persisted and exit code 3.
+    #[arg(long)]
+    pub max_consecutive_task_failures: Option<u32>,
 }
 
 #[cfg(test)]
@@ -279,6 +300,50 @@ mod tests {
     }
 
     #[test]
+    fn phase_3_retry_count_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            "p.md",
+            "--repo",
+            "/r",
+            "--phase-3-retry-count",
+            "1",
+        ])
+        .expect("should parse --phase-3-retry-count");
+
+        match cli.command {
+            Commands::Run(args) => assert_eq!(args.phase_3_retry_count, Some(1)),
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
+        }
+    }
+
+    #[test]
+    fn validate_plan_text_and_min_plan_text_len_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            "p.md",
+            "--repo",
+            "/r",
+            "--validate-plan-text",
+            "--min-plan-text-len",
+            "500",
+        ])
+        .expect("should parse --validate-plan-text and --min-plan-text-len");
+
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.validate_plan_text);
+                assert_eq!(args.min_plan_text_len, Some(500));
+            }
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
+        }
+    }
+
+    #[test]
     fn task_flag_parses() {
         let cli = Cli::try_parse_from([
             "peal", "run", "--plan", "p.md", "--repo", "/r", "--task", "5",
@@ -371,5 +436,25 @@ mod tests {
         let result = Cli::try_parse_from(["peal", "unknown"]);
         let err = result.expect_err("should reject unknown subcommand");
         assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn max_consecutive_task_failures_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "peal",
+            "run",
+            "--plan",
+            "p.md",
+            "--repo",
+            "/r",
+            "--max-consecutive-task-failures",
+            "3",
+        ])
+        .expect("should parse --max-consecutive-task-failures");
+
+        match cli.command {
+            Commands::Run(args) => assert_eq!(args.max_consecutive_task_failures, Some(3)),
+            Commands::Prompt(_) => unreachable!("test uses run subcommand"),
+        }
     }
 }

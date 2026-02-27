@@ -2,15 +2,16 @@ use std::path::PathBuf;
 
 const CURSOR_CLI_INSTALL_URL: &str = "https://docs.cursor.com/cli";
 
+/// User-facing message for invalid/missing plan file (PRD §4 and edge cases table).
 #[derive(Debug, thiserror::Error)]
 pub enum PealError {
-    #[error("Invalid or missing plan file: {path}")]
+    #[error("Invalid or missing plan file.")]
     InvalidPlanFile { path: PathBuf },
 
     #[error("Target path is not a directory: {path}")]
     RepoNotDirectory { path: PathBuf },
 
-    #[error("Invalid or missing plan file: {path}")]
+    #[error("Invalid or missing plan file.")]
     PlanFileNotFound { path: PathBuf },
 
     #[error("Repo path does not exist: {path}")]
@@ -89,4 +90,12 @@ pub enum PealError {
     /// Includes a bounded snippet of the normalized output for debugging.
     #[error("Normalized plan output could not be parsed (no canonical tasks found). Snippet:\n{snippet}")]
     NormalizationParseFailed { snippet: String },
+
+    #[error("Phase 1 returned empty or invalid plan (task {task_index}): {detail}")]
+    Phase1PlanTextInvalid { task_index: u32, detail: String },
+
+    /// Run stopped because the number of consecutive task failures reached the configured cap.
+    /// Automation can detect this condition by error type/message or exit code 3.
+    #[error("Run stopped: {count} consecutive task failure(s) reached cap {cap}.")]
+    ConsecutiveTaskFailuresCapReached { count: u32, cap: u32 },
 }
