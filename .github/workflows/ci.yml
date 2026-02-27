@@ -15,7 +15,7 @@ jobs:
       - name: Install Rust (MSRV)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85
+          toolchain: 1.93
           components: rustfmt, clippy
 
       - name: Cache cargo registry and index
@@ -48,7 +48,7 @@ jobs:
       - name: Install Rust (MSRV)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85
+          toolchain: 1.93
 
       - name: Cache cargo registry and index
         uses: actions/cache@v4

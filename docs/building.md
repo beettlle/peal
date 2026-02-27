@@ -2,7 +2,7 @@
 
 ## Build requirements
 
-- **Rust:** Minimum supported Rust version (MSRV) is **1.85** or newer. The 2024 edition is required; it was stabilized in Rust 1.85. The canonical source of truth is the `rust-version` field in [Cargo.toml](../Cargo.toml) at the repo root.
+- **Rust:** Minimum supported Rust version (MSRV) is **1.93** or newer. The 2024 edition is required; it was stabilized in Rust 1.85. The canonical source of truth is the `rust-version` field in [Cargo.toml](../Cargo.toml) at the repo root.
 
 - **Toolchain (optional):** A [rust-toolchain.toml](../rust-toolchain.toml) at the repo root pins the expected Rust version for this repo so `rustup` uses it by default when working in this directory.
 

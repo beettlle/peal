@@ -22,7 +22,7 @@ Source: consolidated PRD audit (Opinions 1–4). This plan addresses all gaps an
 
 ## Task 5
 
-**Rust edition and minimum version.** Confirm `edition = "2024"` in `Cargo.toml` is supported by the minimum supported Rust version (e.g. 1.85+). In README or docs (e.g. contributing), state the minimum Rust version; optionally add `rust-toolchain.toml` or CI to pin it. If the minimum does not support 2024, change `Cargo.toml` to `edition = "2021"` until the project is ready to depend on a newer compiler.
+**Rust edition and minimum version.** Confirm `edition = "2024"` in `Cargo.toml` is supported by the minimum supported Rust version (e.g. 1.93+). In README or docs (e.g. contributing), state the minimum Rust version; optionally add `rust-toolchain.toml` or CI to pin it. If the minimum does not support 2024, change `Cargo.toml` to `edition = "2021"` until the project is ready to depend on a newer compiler.
 
 ## Phase 2 — Medium Priority
 

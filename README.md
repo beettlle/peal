@@ -35,7 +35,7 @@ Peal turns a markdown plan into executed work: it invokes the Cursor CLI for **p
 
 ## Requirements
 
-- **Rust** 1.85+ (see [Cargo.toml](Cargo.toml) `rust-version`).
+- **Rust** 1.93+ (see [Cargo.toml](Cargo.toml) `rust-version`).
 - **Cursor CLI** — The `agent` (or configured) binary on PATH; see [Cursor CLI docs](https://docs.cursor.com/context/cli-overview).
 - **stet** (optional) — For Phase 3 code review; if not found, Phase 3 is skipped.
 

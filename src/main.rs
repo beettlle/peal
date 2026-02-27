@@ -404,7 +404,10 @@ fn run(cli: Cli) -> anyhow::Result<CommandOutcome> {
                                 if s.len() <= max {
                                     s.to_string()
                                 } else {
-                                    let end = s.floor_char_boundary(max);
+                                    let mut end = max.min(s.len());
+                                    while end > 0 && !s.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
                                     s[..end].to_string()
                                 }
                             };
