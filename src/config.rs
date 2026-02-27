@@ -107,6 +107,10 @@ pub struct PealConfig {
     /// When set, run stops after this many consecutive task failures; state is persisted and exit code 3.
     /// None = cap disabled.
     pub max_consecutive_task_failures: Option<u32>,
+    /// When true, commit all changes in the repo after each Phase 2 so stet can review them
+    /// (stet only reviews committed changes). When stet is not installed, peal still commits so work is saved incrementally.
+    /// Default false for backward compatibility.
+    pub commit_after_phase2: bool,
 }
 
 /// TOML-deserializable config file representation. All fields optional.
@@ -146,6 +150,7 @@ struct FileConfig {
     min_plan_text_len: Option<u64>,
     run_summary_path: Option<PathBuf>,
     max_consecutive_task_failures: Option<u32>,
+    commit_after_phase2: Option<bool>,
 }
 
 /// Intermediate layer where every field is optional, used to merge sources.
@@ -184,6 +189,7 @@ struct ConfigLayer {
     min_plan_text_len: Option<u64>,
     run_summary_path: Option<PathBuf>,
     max_consecutive_task_failures: Option<u32>,
+    commit_after_phase2: Option<bool>,
 }
 
 impl PealConfig {
@@ -331,6 +337,7 @@ impl PealConfig {
             .and_then(|u| u.try_into().ok()),
         run_summary_path: merged.run_summary_path,
         max_consecutive_task_failures: merged.max_consecutive_task_failures,
+        commit_after_phase2: merged.commit_after_phase2.unwrap_or(false),
     })
     }
 }
@@ -374,6 +381,7 @@ fn load_file_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
         min_plan_text_len: fc.min_plan_text_len,
         run_summary_path: fc.run_summary_path,
         max_consecutive_task_failures: fc.max_consecutive_task_failures,
+        commit_after_phase2: fc.commit_after_phase2,
     })
 }
 
@@ -444,6 +452,7 @@ fn load_env_layer(
         min_plan_text_len: parse_env_u64(env_fn, "MIN_PLAN_TEXT_LEN")?,
         run_summary_path: env_fn("RUN_SUMMARY_PATH").map(PathBuf::from),
         max_consecutive_task_failures: parse_env_u32(env_fn, "MAX_CONSECUTIVE_TASK_FAILURES")?,
+        commit_after_phase2: parse_env_bool(env_fn, "COMMIT_AFTER_PHASE2")?,
     })
 }
 
@@ -582,6 +591,11 @@ fn cli_layer_from(args: &RunArgs) -> ConfigLayer {
         min_plan_text_len: args.min_plan_text_len,
         run_summary_path: args.run_summary_path.clone(),
         max_consecutive_task_failures: args.max_consecutive_task_failures,
+        commit_after_phase2: if args.commit_after_phase2 {
+            Some(true)
+        } else {
+            None
+        },
     }
 }
 
@@ -681,6 +695,10 @@ fn merge_layers(file: ConfigLayer, env: ConfigLayer, cli: ConfigLayer) -> Config
             .max_consecutive_task_failures
             .or(env.max_consecutive_task_failures)
             .or(file.max_consecutive_task_failures),
+        commit_after_phase2: cli
+            .commit_after_phase2
+            .or(env.commit_after_phase2)
+            .or(file.commit_after_phase2),
     }
 }
 
@@ -727,6 +745,7 @@ mod tests {
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         }
     }
 
@@ -980,6 +999,7 @@ model = "from-file"
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
 
@@ -1060,6 +1080,7 @@ agent_cmd = "from-file"
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
         let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
 
@@ -1165,6 +1186,7 @@ bogus_key = true
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
 
@@ -1378,6 +1400,7 @@ sandbox = "file-sandbox"
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
         let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, fake_env).unwrap();
 
@@ -1752,6 +1775,55 @@ phase_3_retry_count = 2
         args.phase_3_retry_count = Some(2);
         let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
         assert_eq!(cfg.phase_3_retry_count, 2);
+    }
+
+    #[test]
+    fn commit_after_phase2_defaults_to_false() {
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert!(!cfg.commit_after_phase2);
+    }
+
+    #[test]
+    fn commit_after_phase2_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("peal.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+plan_path = "p.md"
+repo_path = "/r"
+commit_after_phase2 = true
+"#,
+        )
+        .unwrap();
+
+        let args = minimal_cli_args(None, None);
+        let cfg = PealConfig::load_with_env(Some(&cfg_path), &args, no_env).unwrap();
+        assert!(cfg.commit_after_phase2);
+    }
+
+    #[test]
+    fn commit_after_phase2_from_env() {
+        fn fake_env(suffix: &str) -> Option<String> {
+            if suffix == "COMMIT_AFTER_PHASE2" {
+                Some("true".to_owned())
+            } else {
+                None
+            }
+        }
+
+        let args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        let cfg = PealConfig::load_with_env(None, &args, fake_env).unwrap();
+        assert!(cfg.commit_after_phase2);
+    }
+
+    #[test]
+    fn commit_after_phase2_from_cli() {
+        let mut args = minimal_cli_args(Some(PathBuf::from("p.md")), Some(PathBuf::from("/r")));
+        args.commit_after_phase2 = true;
+        let cfg = PealConfig::load_with_env(None, &args, no_env).unwrap();
+        assert!(cfg.commit_after_phase2);
     }
 
     #[test]

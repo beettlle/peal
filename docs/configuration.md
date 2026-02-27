@@ -132,6 +132,7 @@ Every key that affects `PealConfig` is listed below. Required keys must be provi
 | `min_plan_text_len` | `min_plan_text_len` | `MIN_PLAN_TEXT_LEN` (u64) | `--min-plan-text-len` | u64 | — |
 | `run_summary_path` | `run_summary_path` | `RUN_SUMMARY_PATH` | `--run-summary-path` | path | — |
 | `max_consecutive_task_failures` | `max_consecutive_task_failures` | `MAX_CONSECUTIVE_TASK_FAILURES` | `--max-consecutive-task-failures` | u32 (optional) | — (not set = no cap) |
+| `commit_after_phase2` | `commit_after_phase2` | `COMMIT_AFTER_PHASE2` (bool) | `--commit-after-phase2` | bool | `false` |
 
 **Notes:**
 
@@ -142,6 +143,7 @@ Every key that affects `PealConfig` is listed below. Required keys must be provi
   - Extra-args env vars (`STET_START_EXTRA_ARGS`, `STET_RUN_EXTRA_ARGS`): split on comma and whitespace.
 - **`stet_dismiss_patterns`:** Valid `reason` values: `false_positive`, `already_correct`, `wrong_suggestion`, `out_of_scope`. In TOML, use an array of tables with `pattern` and `reason` keys. There is no CLI flag; use TOML or env only.
 - **Config file:** Pass the path with `--config`. If `--config` is not set, no file is loaded.
+- **`commit_after_phase2`:** When **true**, peal runs `git add -A` and `git commit` in `repo_path` after each successful Phase 2 so that stet can review committed changes (stet only reviews `baseline..HEAD`). One commit per task when running sequentially; one commit per parallel block when running in parallel. When stet is not installed, peal still commits when this is set so work is saved incrementally. Default is **false** for backward compatibility.
 - **`agent_cmd` (Windows):** Resolution looks for the exact name in PATH. On Windows, bare names without an extension are resolved using `.exe` (e.g. `agent` → `agent.exe`). If the command is not found, use the full executable name (e.g. `agent.exe`) or an absolute path to the executable.
 
 ---

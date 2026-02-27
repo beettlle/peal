@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
@@ -96,6 +97,72 @@ fn run_custom_stet_run_with_policy(
             return Err(e);
         }
     }
+}
+
+/// Run `git add -A` and `git commit -m "peal: task {task_index}..."` in repo_path.
+/// If `git commit` fails with "nothing to commit" / "working tree clean", logs and returns Ok(()) (no-op).
+fn commit_after_phase2(
+    repo_path: &Path,
+    task_index: u32,
+    message_suffix: Option<&str>,
+) -> Result<(), PealError> {
+    let add_result = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["add", "-A"])
+        .output()
+        .map_err(|e| PealError::CommitAfterPhase2Failed {
+            detail: format!("git add failed: {e}"),
+        })?;
+    if !add_result.status.success() {
+        let stderr = String::from_utf8_lossy(&add_result.stderr);
+        return Err(PealError::CommitAfterPhase2Failed {
+            detail: format!("git add failed: {}", stderr.trim()),
+        });
+    }
+
+    let mut message = format!("peal: task {task_index}");
+    if let Some(suffix) = message_suffix {
+        let truncated = suffix.trim();
+        let truncated = if truncated.len() > 80 {
+            format!("{}...", &truncated[..77])
+        } else {
+            truncated.to_owned()
+        };
+        if !truncated.is_empty() {
+            message.push_str(" - ");
+            message.push_str(&truncated);
+        }
+    }
+
+    let commit_result = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["commit", "-m", &message])
+        .output()
+        .map_err(|e| PealError::CommitAfterPhase2Failed {
+            detail: format!("git commit failed: {e}"),
+        })?;
+
+    if commit_result.status.success() {
+        info!(task_index, "committed after phase 2");
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&commit_result.stderr);
+    let stderr_lower = stderr.to_lowercase();
+    let empty_or_clean = stderr.is_empty()
+        || stderr_lower.contains("nothing to commit")
+        || stderr_lower.contains("working tree clean")
+        || stderr_lower.contains("no changes added to commit");
+    if empty_or_clean {
+        info!(task_index, "nothing to commit after phase 2 (working tree clean)");
+        return Ok(());
+    }
+
+    Err(PealError::CommitAfterPhase2Failed {
+        detail: format!("git commit failed: {}", stderr.trim()),
+    })
 }
 
 /// When config.validate_plan_text is true, checks plan text length (and optionally
@@ -379,6 +446,28 @@ fn run_single_task(
         stdout_len = p2_output.stdout.len(),
         "phase 2 complete"
     );
+
+    if config.commit_after_phase2 {
+        let first_line = p1_output
+            .stdout
+            .lines()
+            .next()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        if let Err(e) = commit_after_phase2(&config.repo_path, task.index, first_line) {
+            error!(
+                task_index = task.index,
+                position,
+                task_count,
+                err = %e,
+                "commit after phase 2 failed"
+            );
+            if let Err(save_err) = state::save_state(peal_state, state_dir) {
+                error!(err = %save_err, "failed to save state after commit failure");
+            }
+            return Err(e);
+        }
+    }
 
     // -- Phase 3 (stet review + address) --
     let phase3_outcome = match phase3_mode {
@@ -849,6 +938,11 @@ pub fn run_scheduled(
                         if let Err(save_err) = state::save_state(peal_state, state_dir) {
                             error!(err = %save_err, "failed to save state after task failure");
                         }
+                        if config.continue_with_remaining_tasks {
+                            failed_task_indices.push(idx);
+                            warn!(task_index = idx, err = %e, "task failed, continuing with remaining tasks");
+                            continue;
+                        }
                         return Err(e);
                     }
                 }
@@ -893,6 +987,24 @@ pub fn run_scheduled(
                     }
                     if !successes.is_empty() {
                         state::save_state(peal_state, state_dir)?;
+                    }
+
+                    if config.commit_after_phase2 && !successes.is_empty() {
+                        let first_idx = indices[0];
+                        let suffix = format!(
+                            "tasks {}",
+                            indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+                        );
+                        if let Err(e) =
+                            commit_after_phase2(&config.repo_path, first_idx, Some(&suffix))
+                        {
+                            error!(
+                                block_indices = ?indices,
+                                err = %e,
+                                "commit after parallel block failed"
+                            );
+                            return Err(e);
+                        }
                     }
 
                     // Phase 3 sequentially in block task order (segment indices order).
@@ -1257,6 +1369,8 @@ mod tests {
     use crate::config::PealConfig;
     use crate::plan::{ParsedPlan, Segment, Task};
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_config(repo: &Path) -> PealConfig {
         PealConfig {
@@ -1293,6 +1407,7 @@ mod tests {
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         }
     }
 
@@ -1344,7 +1459,7 @@ mod tests {
         config.validate_plan_text = true;
         config.min_plan_text_len = Some(100);
 
-        let err = validate_plan_text(&config, 2, "x".repeat(50)).unwrap_err();
+        let err = validate_plan_text(&config, 2, "x".repeat(50).as_str()).unwrap_err();
         match &err {
             PealError::Phase1PlanTextInvalid { task_index, detail } => {
                 assert_eq!(*task_index, 2);
@@ -1375,6 +1490,61 @@ mod tests {
 
         assert!(validate_plan_text(&config, 1, "hello").is_ok());
         assert!(validate_plan_text(&config, 1, "hello world").is_ok());
+    }
+
+    // -- commit_after_phase2 helper tests --
+
+    #[test]
+    fn commit_after_phase2_creates_commit_with_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("init")
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("foo.txt"), "content").unwrap();
+
+        let result = super::commit_after_phase2(repo, 1, Some("my suffix"));
+        assert!(result.is_ok(), "commit should succeed: {:?}", result.err());
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        let msg = String::from_utf8(out.stdout).unwrap();
+        assert!(msg.contains("peal: task 1"), "message should contain task: {}", msg);
+        assert!(msg.contains("my suffix"), "message should contain suffix: {}", msg);
+    }
+
+    #[test]
+    fn commit_after_phase2_nothing_to_commit_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("init")
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("bar.txt"), "x").unwrap();
+        super::commit_after_phase2(repo, 1, None).unwrap();
+
+        // Clean tree: no further changes. Second commit should be no-op and return Ok(())
+        let result = super::commit_after_phase2(repo, 1, None);
+        assert!(result.is_ok(), "nothing to commit should return Ok: {:?}", result.err());
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        let count = String::from_utf8(out.stdout).unwrap().trim().parse::<u32>().unwrap();
+        assert_eq!(count, 1, "should still have exactly one commit");
     }
 
     #[test]
@@ -1471,6 +1641,7 @@ mod tests {
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1691,6 +1862,7 @@ mod tests {
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1882,6 +2054,7 @@ mod tests {
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let mut state = fresh_state();
@@ -2555,6 +2728,7 @@ mod tests {
             min_plan_text_len: None,
             run_summary_path: None,
             max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let mut state = fresh_state();
@@ -2597,6 +2771,7 @@ mod tests {
             .display()
             .to_string();
         config.max_consecutive_task_failures = Some(2);
+        config.continue_with_remaining_tasks = true;
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
         let mut state = fresh_state();

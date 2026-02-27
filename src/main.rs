@@ -44,6 +44,7 @@ fn main() -> ExitCode {
 }
 
 /// Result of a successful run: Prompt has no summary; Run carries outcome and has_issues for exit code.
+#[derive(Debug)]
 pub enum CommandOutcome {
     PromptOk,
     RunOk {
@@ -183,7 +184,7 @@ fn run(cli: Cli) -> anyhow::Result<CommandOutcome> {
                             &config.repo_path,
                             Some(Duration::from_secs(config.phase_timeout_sec)),
                         ) {
-                            Ok(out) => Ok(out),
+                            Ok(_) => Ok(Some(sp.clone())),
                             Err(e) => {
                                 warn!(err = %e, "stet start failed, retrying once");
                                 stet::start_session(
@@ -193,6 +194,7 @@ fn run(cli: Cli) -> anyhow::Result<CommandOutcome> {
                                     &config.repo_path,
                                     Some(Duration::from_secs(config.phase_timeout_sec)),
                                 )
+                                .map(|_| Some(sp.clone()))
                             }
                         }
                     }

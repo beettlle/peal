@@ -69,7 +69,7 @@ pub fn run_phase1(
             max_attempts,
             "invoking phase 1"
         );
-        debug!(phase = 1, task_index, ?args_for_log(&args), "phase 1 argv");
+        debug!(phase = 1, task_index, args_for_log = ?args_for_log(&args), "phase 1 argv");
 
         let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
             .map_err(|e| PealError::PhaseSpawnFailed {
@@ -158,7 +158,7 @@ pub fn run_phase2(
             max_attempts,
             "invoking phase 2"
         );
-        debug!(phase = 2, task_index, ?args_for_log(&args), "phase 2 argv");
+        debug!(phase = 2, task_index, args_for_log = ?args_for_log(&args), "phase 2 argv");
 
         let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
             .map_err(|e| PealError::PhaseSpawnFailed {
@@ -250,7 +250,7 @@ pub fn run_phase3(
             max_attempts,
             "invoking phase 3"
         );
-        debug!(phase = 3, task_index, ?args_for_log(&args), "phase 3 argv");
+        debug!(phase = 3, task_index, args_for_log = ?args_for_log(&args), "phase 3 argv");
 
         let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
             .map_err(|e| PealError::PhaseSpawnFailed {
@@ -309,7 +309,7 @@ pub fn run_phase3_triage(
             max_attempts,
             "invoking phase 3 triage"
         );
-        debug!(?args_for_log(&args), "phase 3 triage argv");
+        debug!(args_for_log = ?args_for_log(&args), "phase 3 triage argv");
 
         let result = subprocess::run_command(&agent_str, &args, &config.repo_path, Some(timeout))
             .map_err(|e| PealError::PhaseSpawnFailed {
@@ -455,6 +455,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         }
     }
 
@@ -482,7 +487,7 @@ mod tests {
         let got = args_for_log(&args);
         assert_eq!(got[0], "--print");
         assert_eq!(got[1], "--plan");
-        assert_eq!(got[2], "<prompt len=22>");
+        assert_eq!(got[2], "<prompt len=24>");
         assert_eq!(got.len(), 3);
     }
 
@@ -704,6 +709,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -770,6 +780,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -815,6 +830,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let sleep_path = crate::cursor::resolve_agent_cmd("sleep").expect("sleep must exist");
@@ -868,6 +888,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -917,6 +942,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -978,6 +1008,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1022,6 +1057,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -1135,6 +1175,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -1198,6 +1243,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1242,6 +1292,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1286,6 +1341,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let false_path = crate::cursor::resolve_agent_cmd("false").expect("false must exist");
@@ -1326,6 +1386,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let bad_path = PathBuf::from("/no/such/binary");
@@ -1373,6 +1438,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let echo_path = PathBuf::from("/bin/echo");
@@ -1436,6 +1506,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let echo_path = PathBuf::from("/bin/echo");

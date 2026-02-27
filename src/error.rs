@@ -98,4 +98,7 @@ pub enum PealError {
     /// Automation can detect this condition by error type/message or exit code 3.
     #[error("Run stopped: {count} consecutive task failure(s) reached cap {cap}.")]
     ConsecutiveTaskFailuresCapReached { count: u32, cap: u32 },
+
+    #[error("Commit after Phase 2 failed: {detail}")]
+    CommitAfterPhase2Failed { detail: String },
 }

@@ -192,7 +192,7 @@ User MAY request "run only task N" (e.g. for debugging). Orchestrator runs phase
 
 ### Scope (when stet is used)
 
-When stet is available, the orchestrator runs stet **in the target repository** (the repo being developed). The orchestrator only shells out to the stet CLI; it does not link to stet or implement review logic. Stet commands and dismiss reasons are documented in the project's [.cursor/rules/stet-integration.mdc](.cursor/rules/stet-integration.mdc).
+When stet is available, the orchestrator runs stet **in the target repository** (the repo being developed). The orchestrator only shells out to the stet CLI; it does not link to stet or implement review logic. Stet commands and dismiss reasons are documented in the project's [.cursor/rules/stet-integration.mdc](.cursor/rules/stet-integration.mdc). **Stet is commit-first:** it reviews only committed changes (e.g. `baseline..HEAD`). An optional "commit after Phase 2" configuration (e.g. `commit_after_phase2`) allows the orchestrator to commit agent edits before phase 3 so stet can see them; when that option is off, phase 3 may see no new diff.
 
 ### Exact command sequence
 

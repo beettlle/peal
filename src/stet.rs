@@ -1530,6 +1530,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1547,6 +1548,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
         let run_stdout = r#"{"findings":[{"id":"f1","message":"unused"}]}"#;
         let result = dismiss_non_actionable_and_rerun(&stet_path, &agent_path, &config, run_stdout).unwrap();
@@ -1571,6 +1577,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1591,6 +1598,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
         let run_stdout = r#"{"findings":[{"id":"f1","message":"unused variable"}]}"#;
         let result = dismiss_non_actionable_and_rerun(&stet_path, &agent_path, &config, run_stdout).unwrap();
@@ -1778,6 +1790,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1795,6 +1808,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let stet_result = StetRunResult {
@@ -1845,6 +1863,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1862,6 +1881,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let stet_result = StetRunResult {
@@ -1946,6 +1970,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -1963,6 +1988,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let initial = StetRunResult {
@@ -2003,6 +2033,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -2020,6 +2051,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let initial = StetRunResult {
@@ -2058,6 +2094,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -2075,6 +2112,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let initial = StetRunResult {
@@ -2194,6 +2236,7 @@ exit 0
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 30,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -2211,6 +2254,11 @@ exit 0
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path: None,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         };
 
         let initial = StetRunResult {

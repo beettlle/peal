@@ -174,6 +174,11 @@ pub struct RunArgs {
     /// Stop run after this many consecutive task failures; state is persisted and exit code 3.
     #[arg(long)]
     pub max_consecutive_task_failures: Option<u32>,
+
+    /// Commit all changes after each Phase 2 so stet can review them (stet only reviews committed changes).
+    /// When stet is not installed, peal still commits so work is saved incrementally. Default: false.
+    #[arg(long, default_value_t = false)]
+    pub commit_after_phase2: bool,
 }
 
 #[cfg(test)]

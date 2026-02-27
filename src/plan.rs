@@ -225,11 +225,10 @@ pub fn parse_plan_file(path: &Path) -> anyhow::Result<ParsedPlan> {
         }
     })?;
 
-    let content = String::from_utf8(bytes).map_err(|e| {
+    let content = String::from_utf8(bytes).map_err(|_| {
         anyhow::anyhow!(PealError::InvalidPlanFile {
             path: path.to_path_buf(),
         })
-        .context(e)
     })?;
 
     if is_canonical_plan_format(&content) {
@@ -391,6 +390,7 @@ mod tests {
             state_dir: PathBuf::from(".peal"),
             phase_timeout_sec: 1800,
             phase_retry_count: 0,
+            phase_3_retry_count: 0,
             parallel: false,
             max_parallel: 4,
             continue_with_remaining_tasks: false,
@@ -408,6 +408,11 @@ mod tests {
             normalize_plan: false,
             normalize_retry_count: 0,
             normalize_prompt_path,
+            validate_plan_text: false,
+            min_plan_text_len: None,
+            run_summary_path: None,
+            max_consecutive_task_failures: None,
+            commit_after_phase2: false,
         }
     }
 
