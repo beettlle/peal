@@ -1015,6 +1015,32 @@ D
         }
     }
 
+    /// Parses docs/improvement-plan.md and asserts 22 tasks, sequential segments, and task indices 1..=22.
+    #[test]
+    fn parse_docs_improvement_plan() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let plan = parse_plan_file(&root.join("docs/improvement-plan.md")).unwrap();
+        assert_eq!(plan.tasks.len(), 22, "improvement-plan.md should have 22 tasks");
+        assert_eq!(
+            plan.tasks.iter().map(|t| t.index).collect::<Vec<_>>(),
+            (1..=22).collect::<Vec<_>>(),
+            "task indices should be 1..=22"
+        );
+        for seg in plan.execution_schedule() {
+            match seg {
+                Segment::Sequential(_) => {}
+                Segment::Parallel(indices) => panic!("improvement-plan has no parallel block, got {:?}", indices),
+            }
+        }
+        for t in &plan.tasks {
+            assert!(
+                !t.content.trim().is_empty(),
+                "improvement-plan task {} has non-empty body",
+                t.index
+            );
+        }
+    }
+
     // -- task_by_index tests --
 
     #[test]
