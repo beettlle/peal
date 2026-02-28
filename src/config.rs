@@ -1832,6 +1832,7 @@ commit_after_phase2 = true
         let prompt_path = dir.path().join("custom-prompt.txt");
         fs::write(&prompt_path, "Convert: {{DOC}}").unwrap();
         let cfg_path = dir.path().join("peal.toml");
+        let path_str = prompt_path.display().to_string().replace('\\', "\\\\");
         fs::write(
             &cfg_path,
             format!(
@@ -1840,7 +1841,7 @@ plan_path = "p.md"
 repo_path = "/r"
 normalize_prompt_path = "{}"
 "#,
-                prompt_path.display()
+                path_str
             ),
         )
         .unwrap();
@@ -1897,6 +1898,7 @@ normalize_prompt_path = "{}"
         let dir = tempfile::tempdir().unwrap();
         let summary_path = dir.path().join("summary.json");
         let cfg_path = dir.path().join("peal.toml");
+        let path_str = summary_path.display().to_string().replace('\\', "\\\\");
         fs::write(
             &cfg_path,
             format!(
@@ -1905,7 +1907,7 @@ plan_path = "p.md"
 repo_path = "/r"
 run_summary_path = "{}"
 "#,
-                summary_path.display()
+                path_str
             ),
         )
         .unwrap();

@@ -175,7 +175,11 @@ mod tests {
     #[test]
     fn respects_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_command("pwd", &[] as &[&str], dir.path(), None).unwrap();
+        let result = if cfg!(target_os = "windows") {
+            run_command("cmd", &["/c", "cd"], dir.path(), None).unwrap()
+        } else {
+            run_command("pwd", &[] as &[&str], dir.path(), None).unwrap()
+        };
 
         // Resolve symlinks for macOS where /tmp -> /private/tmp.
         let expected = dir.path().canonicalize().unwrap();
